@@ -1,0 +1,19 @@
+# Bỏ qua thư mục ảo hóa python local
+myenv/
+venv/
+.venv/
+
+# Bỏ qua git
+.git/
+.gitignore
+
+# Bỏ qua file cache python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Bỏ qua logs cũ và biến môi trường local
+logs/*
+.env
+.DS_Store
