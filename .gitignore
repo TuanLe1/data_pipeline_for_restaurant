@@ -1,0 +1,26 @@
+# ==========================
+# Python Bytecode Files
+__pycache__/
+*.py[cod]
+*$py.class 
+# Virtual Environments
+venv/
+env/
+.venv/
+myenv/
+.env
+
+# Log file and logs directory
+*.log
+logs/
+
+# File data test local (Parquet, CSV...)
+*.parquet
+*.csv
+data/
+temp/
+# File environment local
+.env
+# AWS Credentials
+.aws/
+credentials
