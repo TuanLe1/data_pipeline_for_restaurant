@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: cukcuk  # Tên nhóm nguồn
+    database: AwsDataCatalog  # Tên database trong Athena/Glue
+    schema: restaurant_db
+    tables:
+      - name: invoice_header
+      - name: invoice_detail
+      - name: customer
+      - name: product
+      - name: invoice_payment
+      - name: order_header
+      - name: order_detail

@@ -1,0 +1,13 @@
+name: 'restaurant_analytics'
+version: '1.0.0'
+profile: 'restaurant_athena' # Tên profile trong profiles.yml
+model-paths: ["models"]
+
+models:
+  restaurant_analytics:
+    staging:
+      +materialized: view # Staging có thể là View cho nhẹ
+    marts:
+      +materialized: table
+      +table_type: iceberg # Lưu kết quả dưới dạng Iceberg
+      +format: parquet

@@ -7,18 +7,13 @@
     "Get-SAInvoiceDetail-URL": "/v1/sainvoices/",
     "Get-Product-URL": "/v1/inventoryitems/paging",
     "Get-Customer-URL": "/v1/customers/paging",
-    "AppID": "CUKCUKOpenPlatform",
+    "AppID": "",
     "AWS_REGION": "ap-southeast-2",
     "AWS_GLUE_DB": "restaurant_db",
     "AWS_S3_BUCKET": "s3://restaurant-datalake",
     "Branch-Name_Mapper": {
-        "9489ba59-600f-491e-aa0a-4bd842a4b278": "URAETEI TK",
-        "994c6fe5-da83-441b-a0e8-57a6fed98fb2": "URAETEI HANARE",
-        "031fb45e-b1d4-44c3-9389-a20fd4f36933": "SUSHI HONDA",
-        "4329419d-fbe0-4def-9b26-b17cb2f0f6ee": "URAETEI LITE",
-        "475eb930-f7b4-41ae-a890-da935bb6be53": "SUSHI URAETEI",
-        "2d49aac1-030f-4176-8e45-edb2239826e7": "URAETEI BKK",
-        "33a254df-3bf2-4738-ac43-2af12f90537b": "URAETEI TK II"
+        "9489ba59-600f-491e-aa0a-4bd842a4b278": "",
+        "994c6fe5-da83-441b-a0e8-57a6fed98fb2": ""
     },
     "Schema": {
         "order_header": {
