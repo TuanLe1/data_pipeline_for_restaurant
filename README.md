@@ -1,162 +1,152 @@
-# 🥗 Serverless Restaurant Data Lakehouse
+# 🥗 Serverless Restaurant Data Platform (Modern Data Stack)
 
-![Python](https://img.shields.io/badge/Python-3.10-blue.svg)
-![Architecture](https://img.shields.io/badge/Architecture-Lakehouse-orange.svg)
-![Cost](https://img.shields.io/badge/Cost-Serverless-green.svg)
-![Status](https://img.shields.io/badge/Pipeline-Production--Ready-success.svg)
+![Airflow](https://img.shields.io/badge/Orchestration-Apache%20Airflow-blue?style=flat&logo=apacheairflow) ![dbt](https://img.shields.io/badge/Transformation-dbt%20Core-orange?style=flat&logo=dbt) ![Iceberg](https://img.shields.io/badge/Data%20Lake-Apache%20Iceberg-cyan?style=flat&logo=apache) ![AWS](https://img.shields.io/badge/Cloud-AWS-232F3E?style=flat&logo=amazon-aws) ![Status](https://img.shields.io/badge/Status-Production%20Ready-success)
 
 ## 📖 Overview
 
-This project implements a robust, scalable Serverless Data Lakehouse designed to transform raw restaurant operations data (from the CukCuk API) into actionable business insights.
+This project implements a scalable, resilient **Serverless Data Lakehouse** designed to ingest, transform, and analyze restaurant operations data (Sales, Inventory, Customers) from the CukCuk API.
 
-By leveraging Apache Iceberg on AWS S3 combined with AWS Athena, this solution provides a cost-effective alternative to traditional Data Warehouses (like Redshift/Snowflake), reducing storage and compute costs while maintaining high query performance and ACID compliance.
+Transitioning from legacy batch scripts, this platform adopts a **Modern Data Stack** architecture using **Apache Airflow** for orchestration, **dbt Core** for modular transformations, and **Apache Iceberg** on AWS S3 for ACID-compliant storage — a cost-effective alternative to traditional data warehouses.
 
-## Architecture — Overview
+---
+
+## 🏗️ Architecture
+
 ![System architecture flow](./images/restaurant_architecture.PNG)
-1.  **Source (CukCuk API):** Exposes raw transactional data (Sales, Inventory, Customers) via REST endpoints.
-2.  **Ingestion (AWS ECS / Docker):**
-    * Runs Python **AsyncIO** workers to fetch data concurrently.
-    * Implements **Blind Batching Strategy** to handle pagination efficiently.
-    * Securely fetches credentials from **AWS SSM Parameter Store**.
-3.  **Storage (AWS S3 & Iceberg):**
-    * Data is transformed and written to **AWS S3** in **Parquet** format.
-    * **Apache Iceberg** handles ACID transactions, schema evolution, and time-travel.
-4.  **Catalog (AWS Glue):** Acts as the central metadata repository, mapping S3 objects to relational tables.
-5.  **Query Engine (AWS Athena):** Performs serverless SQL queries directly on S3 data via the Glue Catalog.
-6.  **Visualization (Looker Studio):** Consumes aggregated data from Athena to visualize business KPIs (Revenue, Daily Orders, etc.).
+
+### ELT Flow
+1. Orchestration (Apache Airflow)
+  - Manages the end-to-end dependency graph, scheduling, retries, and automated backfills.
+2. Extraction (Python & AsyncIO)
+  - High-throughput ingestion with `asyncio` and a Blind Batching strategy to handle API pagination.
+  - Writes raw data to S3 in Apache Iceberg format (Bronze layer).
+3. Transformation (dbt Core)
+  - Staging: clean raw data, enforce schemas, type casting.
+  - Marts: aggregate business metrics (Revenue, Retention) into analytics-ready tables.
+  - Quality Gates: `dbt test` blocks execution if validations fail.
+4. Serving (AWS Athena)
+  - Serverless SQL queries directly on S3-backed Iceberg tables.
+5. Analytics (Looker Studio)
+  - Visualize KPIs for stakeholders.
 
 ---
 
-## 💡 Business Value & Key Solutions
+## 💡 Key Technical Highlights
 
-### 🎯 1. Unlocking Business Intelligence
-This pipeline transforms raw API data into a centralized analytical asset, empowering stakeholders to answer critical operational questions:
-* **📈 Revenue Analytics:** Real-time tracking of daily sales performance across multiple branches/locations.
-* **⏰ Peak Hour Optimization:** Heatmaps of order volumes to optimize staff scheduling and kitchen prep.
-* **🍽️ Product Performance:** Identify top-selling dishes vs. underperforming items to adjust menus dynamically.
-* **👥 Customer Retention:** Analyze returning customers vs. new walk-ins to tailor marketing strategies.
-* **📉 Inventory Leakage:** Reconcile sold items (Orders) vs. billed ingredients (Invoices) to detect discrepancies.
+### 🚀 Resilient Orchestration & Self-Healing
+- Automated backfills via specialized DAGs (e.g., `maintenance_weekly_backfill`) that detect gaps and re-run partitions.
+- Idempotent jobs ensure consistent results on retries.
 
----
+### ⚡ Cost-Effective "Merge-on-Read"
+- Use Iceberg + dbt incremental models for optimized upserts instead of full-partition rewrites.
+- Achieves significant cost savings for CDC and row-level updates.
 
-### 🚀 2. Cost-Optimized "Lakehouse" Architecture
-* **Zero-Idle Compute:** Deployed on **AWS ECS Fargate** (Serverless). Costs are incurred only during execution seconds, eliminating expensive idle servers.
-* **Smart Storage:** Replaces expensive Data Warehouses (Redshift/Snowflake) with **AWS S3 + Apache Iceberg**, drastically reducing storage costs while maintaining ACID compliance.
-* **Serverless Querying:** Leverages **AWS Athena** to query S3 directly. **Iceberg Partitioning** ensures queries scan only relevant data files, significantly lowering per-query costs.
+### 🛡️ Data Quality First
+- Schema validation and dbt business tests (e.g., `revenue > 0`, `order_date <= current_date`).
+- Slack alerts for failures and anomalies.
 
 ---
 
-### ⚡ 3. High-Performance Engineering
-* **Hybrid Concurrency:** Combines `multiprocessing` to utilize all CPU cores for parallel daily workloads and `asyncio` to handle thousands of non-blocking network requests.
-* **Blind Batching Strategy:** Overcomes API pagination bottlenecks by fetching pages in parallel chunks (e.g., 5 pages/batch), increasing extraction throughput by **300%**.
-* **Parallel S3 Writes:** Uses `ThreadPoolExecutor` to upload Header, Detail, and Payment tables simultaneously, minimizing I/O wait times.
+## 🛠️ Tech Stack
+
+| Category | Technology | Usage |
+| :--- | :--- | :--- |
+| Orchestration | Apache Airflow | Scheduling, DAGs, Backfilling (Docker) |
+| Transformation | dbt Core | SQL transformations, testing, docs |
+| Storage Format | Apache Iceberg | ACID, time-travel, schema evolution |
+| Cloud Storage | AWS S3 | Bronze/Silver/Gold layers |
+| Query Engine | AWS Athena | Serverless SQL |
+| Language | Python 3.10 | Extractors (`asyncio`, `boto3`), Airflow operators |
+| Infra | Docker | Local dev & reproducible environment |
 
 ---
 
-### 🛡️ 4. Reliability & Automation
-* **Resilient Network Logic:** Implements **Exponential Backoff with Jitter**. If the API throttles (429) or fails (5xx), workers sleep for randomized durations to prevent "thundering herd" issues.
-* **Self-Healing Auth:** Lazy singleton authentication prevents token flooding. Automatically refreshes tokens upon 401 errors without crashing the pipeline.
-* **Data Integrity & Cleaning:** Automatically handles schema enforcement, type casting, and deduplication using Pandas before ingestion using strict schema validation logic.
-* **Real-time Observability:** Integrated **Slack Webhooks** provide instant alerts for job status (Start/Success/Failure), enabling proactive monitoring.
+## 📂 Project Structure
 
-## Tech Stack
-* **Core:** Python 3.10, Pandas
-* **Concurrency:** `asyncio`, `aiohttp`, `multiprocessing`
-* **Data Lake:** Apache Iceberg (`pyiceberg`), PyArrow
-* **Cloud:** AWS S3, ECS, SSM, Glue, Athena
-* **Ops:** Docker, Slack API
-
-## Project Layout
-
-```
+```text
 data_pipeline_for_restaurant/
-├── configs/           # Static, non-sensitive configuration (config.json)
-├── src/
-│   ├── extractors/    # Async fetching, retry & batching
-│   ├── transformers/  # Data cleaning & normalization
-│   ├── loaders/       # S3 / Iceberg writers
-│   └── utils/         # SSM loader, slack alerts, verifiers
-├── Dockerfile
-├── main.py            # Entrypoint & multiprocessing coordinator
-└── requirements.txt
+├── configs/                   # Configuration files (JSON)
+├── dags/
+│   ├── repos/
+│   │   ├── dbt_project/       # dbt project (models, tests, seeds)
+│   │   ├── scripts/           # Python script entrypoints (run_etl.py)
+│   │   └── src/               # Core application logic (extractors, loaders)
+│   ├── restaurant_etl_dag.py  # Main production DAG
+│   └── weekly_backfill.py     # Maintenance/backfill DAG
+├── docker-compose.yaml        # Airflow & local environment
+├── Dockerfile                 # Custom Airflow image (dbt & AWS CLI)
+└── requirements.txt           # Python deps
 ```
 
-## Quickstart
+---
+
+## 🚀 Quickstart
 
 ### Prerequisites
-* **Docker** installed.
-* **AWS Account** with permissions for S3, Glue, Athena, and SSM.
-* **Python 3.10+** (if running locally).
+- Docker Desktop (4GB+ RAM recommended)
+- AWS credentials with S3/Athena/Glue permissions
 
-### 1. Configure Secrets (AWS SSM)
-
-Create a SecureString parameter (example name: `/cukcuk/app_config`) in AWS Systems Manager Parameter Store with the following JSON structure:
-
-```json
-{
-  "AppID": "CUKCUKOpenPlatform",
-  "Domain": "graphapi.cukcuk.com",
-  "CompanyCode": "your_company_code",
-  "secret_key": "your_actual_secret_key",
-  "Slack-Webhook-URL": "https://hooks.slack.com/services/..."
-}
-```
-
-### 2. Configure Local Settings
-
-Edit `configs/config.json` for base URL, bucket names and partition columns. Example:
-
-```json
-{
-  "CukCuk-Base-URL": "https://graphapi.cukcuk.com/api",
-  "Branch-Name_Mapper": {},
-  "Partition-Column": {}
-}
-```
-
-Backfill (example: last 7 days):
+### 1. Setup environment
+Create a `.env` file in the repo root:
 
 ```bash
-python main.py --days 7 --workers 4
+AIRFLOW_UID=50000
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+AWS_DEFAULT_REGION=ap-southeast-2
 ```
 
-## Verifying Output
+### 2. Configure AWS SSM (Secrets)
+Ensure the following parameter exists in your AWS Systems Manager Parameter Store:
 
-Scan Iceberg tables using `pyiceberg`:
+Path: /cukcuk/app_config
 
-```python
-from pyiceberg.catalog import load_catalog
+Type: SecureString
 
-catalog = load_catalog("default")
-table = catalog.load_table("restaurant_db.invoice_header")
-df = table.scan().to_pandas()
-print(df.head())
-print(f"Total Rows: {len(df)}")
+Content: Contains API tokens and Slack Webhook URL (JSON format).
+
+### 3. Start the Platform
+Run the entire stack using Docker Compose:
+```bash
+docker-compose up -d --build
 ```
+### 4. Trigger the Pipeline
+Access the Airflow UI at http://localhost:8080.
 
-Via AWS Athena (SQL):
-```SQL
-SELECT branch_name, SUM(total_amount) 
-FROM "restaurant_db"."order_header" 
-WHERE order_date = current_date - interval '1' day 
-GROUP BY 1;
-```
+Login with default credentials: airflow / airflow.
 
-## Dashboard and Monitoring
-![Looker Studio Dashboard](./images/looker.png)
+Enable the restaurant_elt_pipeline DAG (toggle the switch to On).
 
-![Slack Alert Notification](./images/slack_restaurant.PNG)
+Click the Trigger button (Play icon) to start the DAG manually or wait for the scheduled run.
 
-## Future Improvements
 
-- Move orchestration to Airflow for scheduling and dependency visibility
-- Add Great Expectations for data quality checks before load
+**Pipeline Graph View:**
 
-## Files of Interest
+*Visualizing the dependency chain: Async Extraction (Python) → S3 Loading → dbt Transformation (Staging & Marts).*
 
-- `configs/config.json` — non-sensitive settings
-- `main.py` — entrypoint and multiprocessing coordinator
-- `src/extractors/` — extraction logic
-- `src/transformers/` — cleaning & schema mapping
-- `src/loaders/` — Iceberg write logic
+![Airflow DAG Graph](./images/restaurant_etl_pipeline.PNG)
 
+---
+
+### 5. Verify Data (AWS Athena)
+Once the pipeline shows a `Success` status, you can query the transformed tables directly in AWS Athena to verify the results (e.g., aggregating Daily Revenue).
+
+![Athena Query Result](./images/query_result.PNG)
+
+## 📊 Monitoring & Outputs
+### Dashboard (Looker Studio)
+Visualizing Daily Revenue, Order Volume, and Customer Retention.
+
+![Slack alert](./images/daily_report.PNG)
+
+### Slack Alerts
+Real-time notifications for pipeline status (Success/Failure).
+
+![Slack alert](./images/slack_alert.PNG)
+
+## 👨‍💻 Author
+Tuan Le - Data Engineer
+
+Project: Serverless Restaurant Data Platform
+
+Focus: Building scalable, cost-effective data solutions using AWS & Modern Data Stack.

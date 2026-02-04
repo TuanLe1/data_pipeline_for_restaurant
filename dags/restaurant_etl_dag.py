@@ -1,9 +1,24 @@
 import os
+import sys
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.providers.docker.operators.docker import DockerOperator
 from docker.types import Mount
+
+
+# 👇 1. THÊM ĐOẠN NÀY ĐỂ AIRFLOW TÌM THẤY FOLDER 'repos'
+dag_folder = os.path.dirname(__file__)
+repos_path = os.path.join(dag_folder, 'repos')
+if repos_path not in sys.path:
+    sys.path.append(repos_path)
+
+# 👇 2. GIỜ MỚI IMPORT ĐƯỢC
+try:
+    from src.utils.slack_alert import task_fail_slack_alert
+except ImportError:
+    # Fallback phòng hờ
+    from repos.src.utils.slack_alert import task_fail_slack_alert
 
 # --- CẤU HÌNH ĐƯỜNG DẪN ---
 AIRFLOW_INTERNAL_PATH = "/opt/airflow/dags/repos"
@@ -17,6 +32,7 @@ default_args = {
     'owner': 'tuanle',
     'retries': 2, # Tăng lên 2 để nếu mạng lag thì tự thử lại
     'retry_delay': timedelta(minutes=5),
+    'on_failure_callback': task_fail_slack_alert
 }
 
 with DAG(
@@ -75,7 +91,7 @@ with DAG(
         force_pull=False,
         api_version='auto',
         auto_remove=True,
-        command="dbt run --profiles-dir /dbt --project-dir /dbt",
+        command="dbt build --profiles-dir /dbt --project-dir /dbt",
         mount_tmp_dir=False,
         docker_url="unix://var/run/docker.sock",
         network_mode="bridge",

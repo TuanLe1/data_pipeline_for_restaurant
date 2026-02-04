@@ -2,7 +2,7 @@
 
 SELECT 
     product_id,
-    product_code, -- Python đã đổi tên rồi, gọi thẳng tên này
+    product_code,
     product_name,
     unit_name,
     price,

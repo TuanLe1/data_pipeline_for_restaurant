@@ -6,8 +6,8 @@ model-paths: ["models"]
 models:
   restaurant_analytics:
     staging:
-      +materialized: view # Staging có thể là View cho nhẹ
+      +materialized: view
     marts:
       +materialized: table
-      +table_type: iceberg # Lưu kết quả dưới dạng Iceberg
+      +table_type: iceberg
       +format: parquet

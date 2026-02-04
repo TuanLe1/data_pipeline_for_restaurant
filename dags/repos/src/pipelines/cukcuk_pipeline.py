@@ -30,10 +30,7 @@ class CukCukETLPipeline:
         if not raw_data:
             return pd.DataFrame()
         return self.transformer.transform(raw_data, table_name)
-
-    # ==========================================================================
-    # 🛠 HELPER: LOAD (Common function - Đã chuẩn)
-    # ==========================================================================
+    
     def _load_dfs_to_s3(self, dfs_map: dict, time_col: str = None):
         """Hàm chung để đẩy danh sách DataFrame lên S3."""
         if not dfs_map:
@@ -63,9 +60,6 @@ class CukCukETLPipeline:
             logger.error(f"❌ Failed writing table {table_name}: {e}")
             raise e
 
-    # ==========================================================================
-    # 🛠 HELPER: EXTRACT & TRANSFORM LOGIC
-    # ==========================================================================
     async def _fetch_master_data_async(self):
         task_prod = self.extractor.extract_products()
         task_cust = self.extractor.extract_customers()
@@ -119,9 +113,6 @@ class CukCukETLPipeline:
             
         return dfs
 
-    # ======================================================
-    # 🟢 PHASE 1: MASTER DATA (Split)
-    # ======================================================
     async def extract_master_to_disk(self):
         """Bước 1: Tải API -> Lưu JSON xuống Disk"""
         logger.info("⬇️ [Master] Extracting to Disk...")
@@ -152,9 +143,6 @@ class CukCukETLPipeline:
         self._load_dfs_to_s3(dfs, time_col=None)
         logger.info("✅ [Master] Finished.")
 
-    # ======================================================
-    # 🟢 PHASE 2: TRANSACTIONS (Split)
-    # ======================================================
     async def extract_trans_to_disk(self, target_date: datetime):
         day_str = target_date.strftime("%Y-%m-%d")
         path = f"{TEMP_DATA_DIR}/{day_str}"

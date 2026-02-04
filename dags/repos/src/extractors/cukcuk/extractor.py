@@ -158,7 +158,7 @@ class CukCukExtractor:
                     header_tasks.append(self._call_api_async(session, url, method="POST", json_body=payload))
                 
                 # Nếu API lỗi, hàm _call_api_async sẽ RAISE exception, 
-                # asyncio.gather sẽ ném lỗi đó ra ngoài => Script dừng => Airflow Failed (ĐÚNG Ý MUỐN)
+                # asyncio.gather sẽ ném lỗi đó ra ngoài => Script dừng => Airflow Failed
                 header_results = await asyncio.gather(*header_tasks)
                 
                 valid_orders_in_batch = []

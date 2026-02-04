@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: master_sales_analytics
+    description: "Bảng phân tích doanh thu tổng hợp (Marts). Dữ liệu đã được làm sạch và Incremental theo ngày."
+    columns:
+      - name: order_id
+        description: "Mã định danh đơn hàng."
+        tests:
+          - not_null
+
+      - name: item_id
+        description: "Mã định danh món ăn trong đơn hàng."
+        tests:
+          - not_null
+
+      - name: report_date
+        description: "Ngày báo cáo doanh thu. Dùng cột này để Partition và Filter."
+        tests:
+          - not_null
+
+      - name: net_revenue_inclusive
+        description: "Doanh thu tổng sau thuế (Gross Revenue). Công thức = Amount - Giảm giá + Thuế."
+        tests:
+          - not_null
+
+      - name: customer_id
+        description: "ID khách hàng. (Lưu ý: Tên và SĐT đã bị ẩn danh hóa ở tầng Staging)."

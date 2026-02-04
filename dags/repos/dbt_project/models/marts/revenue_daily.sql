@@ -15,12 +15,10 @@ SELECT
     branch_name,
     year,
     month,
-    -- SỬA Ở ĐÂY: Dùng ref_id thay vì invoice_id
     COUNT(DISTINCT ref_id) as total_orders, 
     
     SUM(total_amount) as total_revenue,
     
-    -- Tránh chia cho 0
     CASE 
         WHEN COUNT(DISTINCT ref_id) > 0 THEN SUM(total_amount) / COUNT(DISTINCT ref_id)
         ELSE 0 
