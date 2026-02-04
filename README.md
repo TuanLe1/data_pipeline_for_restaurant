@@ -16,18 +16,18 @@ Transitioning from legacy batch scripts, this platform adopts a **Modern Data St
 
 ### ELT Flow
 1. Orchestration (Apache Airflow)
-  - Manages the end-to-end dependency graph, scheduling, retries, and automated backfills.
+    - Manages the end-to-end dependency graph, scheduling, retries, and automated backfills.
 2. Extraction (Python & AsyncIO)
-  - High-throughput ingestion with `asyncio` and a Blind Batching strategy to handle API pagination.
-  - Writes raw data to S3 in Apache Iceberg format (Bronze layer).
+    - High-throughput ingestion with `asyncio` and a Blind Batching strategy to handle API pagination.
+    - Writes raw data to S3 in Apache Iceberg format (Bronze layer).
 3. Transformation (dbt Core)
-  - Staging: clean raw data, enforce schemas, type casting.
-  - Marts: aggregate business metrics (Revenue, Retention) into analytics-ready tables.
-  - Quality Gates: `dbt test` blocks execution if validations fail.
+    - Staging: clean raw data, enforce schemas, type casting.
+    - Marts: aggregate business metrics (Revenue, Retention) into analytics-ready tables.
+    - Quality Gates: `dbt test` blocks execution if validations fail.
 4. Serving (AWS Athena)
-  - Serverless SQL queries directly on S3-backed Iceberg tables.
+    - Serverless SQL queries directly on S3-backed Iceberg tables.
 5. Analytics (Looker Studio)
-  - Visualize KPIs for stakeholders.
+    - Visualize KPIs for stakeholders.
 
 ---
 

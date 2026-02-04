@@ -63,4 +63,4 @@ dags/repos/dbt_project/*.msgpack
 credentials
 
 # File config chứa thông tin nhạy cảm
-configs/config.json
+# configs/config.json
