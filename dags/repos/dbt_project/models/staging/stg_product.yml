@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: stg_product
+    description: "Danh mục sản phẩm/món ăn từ hệ thống CukCuk."
+    columns:
+      - name: product_id
+        description: "Mã định danh sản phẩm."
+        tests:
+          - unique
+          - not_null
+      - name: product_code
+        description: "Mã SKU hoặc mã vạch của sản phẩm."
+      - name: product_name
+        description: "Tên hiển thị của sản phẩm."
+      - name: price
+        description: "Giá bán niêm yết hiện tại."

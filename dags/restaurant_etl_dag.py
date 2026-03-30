@@ -3,8 +3,6 @@ import sys
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-from airflow.providers.docker.operators.docker import DockerOperator
-from docker.types import Mount
 
 
 # 👇 1. THÊM ĐOẠN NÀY ĐỂ AIRFLOW TÌM THẤY FOLDER 'repos'
@@ -23,7 +21,6 @@ except ImportError:
 # --- CẤU HÌNH ĐƯỜNG DẪN ---
 AIRFLOW_INTERNAL_PATH = "/opt/airflow/dags/repos"
 HOST_DBT_PATH = "/home/tuanle/DE-lab/data_pipeline_for_restaurant/dags/repos/dbt_project"
-HOST_AWS_PATH = "/home/tuanle/.aws"
 
 # Đường dẫn đến file script điều phối mới (bạn nhớ tạo file này như bước trước nhé)
 ETL_SCRIPT_PATH = f"{AIRFLOW_INTERNAL_PATH}/scripts/run_etl.py"
@@ -38,7 +35,7 @@ default_args = {
 with DAG(
     'restaurant_elt_pipeline',
     default_args=default_args,
-    description='Full ELT: Split Architecture (Extract -> Disk -> S3 -> dbt)',
+    description='Full ELT: Extract -> Snowflake -> dbt',
     schedule_interval='0 8 * * *',
     start_date=datetime(2024, 1, 20),
     params={"manual_trigger": "yes"},
@@ -85,24 +82,15 @@ with DAG(
     # GROUP 3: TRANSFORM (dbt)
     # =================================================================
     
-    t_dbt_run = DockerOperator(
-        task_id='dbt_run',
-        image='custom-dbt-athena:1.7.1',
-        force_pull=False,
-        api_version='auto',
-        auto_remove=True,
-        command="dbt build --profiles-dir /dbt --project-dir /dbt",
-        mount_tmp_dir=False,
-        docker_url="unix://var/run/docker.sock",
-        network_mode="bridge",
-        mounts=[
-            Mount(source=HOST_DBT_PATH, target="/dbt", type="bind"),
-            Mount(source=HOST_AWS_PATH, target="/root/.aws", type="bind"),
-        ],
-        environment={
-            'AWS_REGION': 'ap-southeast-2'
-        }
+    t_dbt_run = BashOperator(
+    task_id='dbt_run',
+    bash_command=(
+        f'cd {AIRFLOW_INTERNAL_PATH}/dbt_project && '
+        'dbt build '
+        '--profiles-dir . '
+        '--project-dir .'
     )
+)
 
     # =================================================================
     # 🔗 THIẾT LẬP DEPENDENCIES (LUỒNG CHẠY)

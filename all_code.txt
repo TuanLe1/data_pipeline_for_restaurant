@@ -1,0 +1,1823 @@
+========================================
+FILE: ./docker-compose.yaml
+========================================
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    
+    # --- CẤU HÌNH AWS CHUẨN (Chỉ dùng biến môi trường) ---
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./configs:/opt/airflow/configs
+    - /var/run/docker.sock:/var/run/docker.sock
+  
+  user: "${AIRFLOW_UID}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+
+volumes:
+  postgres-db-volume:-e 
+
+========================================
+FILE: ./dags/repos/src/loaders/snowflake_loader.py
+========================================
+import pandas as pd
+import logging
+from snowflake.connector.pandas_tools import write_pandas
+import snowflake.connector
+
+logger = logging.getLogger(__name__)
+
+class SnowflakeLoader:
+    def __init__(self, config: dict):
+        self.config = config
+        sf_config = self.config.get("SNOWFLAKE", {})
+        self.conn = snowflake.connector.connect(
+            account=sf_config.get("ACCOUNT"),
+            user=sf_config.get("USER"),
+            password=sf_config.get("PASSWORD"),
+            role=sf_config.get("ROLE", "DE_ROLE"),
+            warehouse=sf_config.get("WAREHOUSE", "RESTAURANT_ETL_WH"),
+            database=sf_config.get("DATABASE", "RESTAURANT_DB"),
+            schema="BRONZE"
+        )
+
+    def _create_variant_table_if_not_exists(self, table_name: str):
+        """Đảm bảo bảng Bronze có cấu trúc VARIANT"""
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS BRONZE.{table_name} (
+            RAW_DATA VARIANT,
+            INGESTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        """
+        self.conn.cursor().execute(create_sql)
+
+    def save_table(self, data: list, table_name: str):
+        """
+        Nạp một danh sách các dict vào Snowflake dưới dạng JSON VARIANT.
+        """
+        if not data:
+            logger.warning(f"⚠️ No data to load for {table_name}. Skipping.")
+            return
+
+        # Chuẩn hóa tên bảng: RAW_ORDER_HEADER_JSON
+        table_name_upper = f"RAW_{table_name.upper()}_JSON"
+        self._create_variant_table_if_not_exists(table_name_upper)
+
+        # Chuyển list dict -> DataFrame -> 1 cột JSON
+        df = pd.DataFrame(data)
+        upload_df = pd.DataFrame({
+            'RAW_DATA': df.apply(lambda x: x.to_dict(), axis=1)
+        })
+
+        try:
+            write_pandas(
+                conn=self.conn,
+                df=upload_df,
+                table_name=table_name_upper,
+                database=self.config.get("SNOWFLAKE", {}).get("DATABASE"),
+                schema="BRONZE",
+                auto_create_table=False
+            )
+            logger.info(f"✅ Ingested {len(upload_df)} rows to {table_name_upper}")
+        except Exception as e:
+            logger.error(f"❌ Failed to load {table_name_upper}: {e}")
+            raise e
+
+    def load_extracted_data(self, extracted_data: dict, data_type: str):
+        """
+        HÀM MỚI: Tự động điều hướng dữ liệu từ Extractor vào các bảng tương ứng.
+        data_type: 'orders', 'invoices', 'customers', hoặc 'products'
+        """
+        if data_type == 'orders':
+            # Nạp 2 bảng: ORDER_HEADER và ORDER_DETAIL
+            self.save_table(extracted_data.get('headers', []), 'ORDER_HEADER')
+            self.save_table(extracted_data.get('details', []), 'ORDER_DETAIL')
+            
+        elif data_type == 'invoices':
+            # Nạp 3 bảng: INVOICE_HEADER, INVOICE_DETAIL, INVOICE_PAYMENT
+            self.save_table(extracted_data.get('headers', []), 'INVOICE_HEADER')
+            self.save_table(extracted_data.get('details', []), 'INVOICE_DETAIL')
+            self.save_table(extracted_data.get('payments', []), 'INVOICE_PAYMENT')
+            
+        elif data_type == 'customers':
+            self.save_table(extracted_data, 'CUSTOMER')
+            
+        elif data_type == 'products':
+            self.save_table(extracted_data, 'PRODUCT')
+
+    def close(self):
+        self.conn.close()-e 
+
+========================================
+FILE: ./dags/repos/src/pipelines/cukcuk_pipeline.py
+========================================
+import os
+import json
+import shutil
+import logging
+import asyncio
+from datetime import datetime, timedelta
+
+from src.extractors.cukcuk.extractor import CukCukExtractor
+from src.loaders.snowflake_loader import SnowflakeLoader
+
+logger = logging.getLogger(__name__)
+
+TEMP_DATA_DIR = "/tmp/restaurant_temp_data"
+
+class CukCukETLPipeline:
+    def __init__(self, config: dict):
+        self.config = config
+        self.extractor = CukCukExtractor(config)
+        self.loader = SnowflakeLoader(config)
+
+    # =================================================================
+    # MASTER DATA (Product, Customer)
+    # =================================================================
+    async def extract_master_to_disk(self):
+        logger.info("⬇️ [Master] Extracting Products & Customers to Disk...")
+        path = f"{TEMP_DATA_DIR}/master"
+        os.makedirs(path, exist_ok=True)
+        
+        prods = await self.extractor.extract_products()
+        custs = await self.extractor.extract_customers()
+        
+        with open(f"{path}/products.json", 'w', encoding='utf-8') as f: 
+            json.dump(prods, f, ensure_ascii=False)
+        with open(f"{path}/customers.json", 'w', encoding='utf-8') as f: 
+            json.dump(custs, f, ensure_ascii=False)
+
+    def load_master_from_disk_to_snowflake(self):
+        logger.info("🚀 [Master] Loading Master Data to Snowflake...")
+        path = f"{TEMP_DATA_DIR}/master"
+        
+        with open(f"{path}/products.json", 'r', encoding='utf-8') as f: prods = json.load(f)
+        with open(f"{path}/customers.json", 'r', encoding='utf-8') as f: custs = json.load(f)
+            
+        self.loader.load_extracted_data(prods, 'products')
+        self.loader.load_extracted_data(custs, 'customers')
+
+    # =================================================================
+    # TRANSACTION DATA (Orders, Invoices)
+    # =================================================================
+    async def extract_trans_to_disk(self, target_date: datetime):
+        day_str = target_date.strftime("%Y-%m-%d")
+        path = f"{TEMP_DATA_DIR}/{day_str}"
+        os.makedirs(path, exist_ok=True)
+        
+        start = target_date.strftime("%Y-%m-%dT%H:%M:%S")
+        end = (target_date + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        
+        # Gọi Extractor (Bản mới trả về Dictionary)
+        order_data = await self.extractor.extract_orders(start, end)
+        invoice_data = await self.extractor.extract_invoices(start, end)
+        
+        # Lưu file Header & Detail riêng biệt
+        with open(f"{path}/orders_split.json", 'w', encoding='utf-8') as f: 
+            json.dump(order_data, f, ensure_ascii=False)
+        with open(f"{path}/invoices_split.json", 'w', encoding='utf-8') as f: 
+            json.dump(invoice_data, f, ensure_ascii=False)
+
+    def load_trans_from_disk_to_snowflake(self, target_date: datetime):
+        day_str = target_date.strftime("%Y-%m-%d")
+        path = f"{TEMP_DATA_DIR}/{day_str}"
+        
+        logger.info(f"🚀 [Trans] Loading Data for {day_str} to Snowflake...")
+
+        # 1. Load Orders (Header + Detail)
+        if os.path.exists(f"{path}/orders_split.json"):
+            with open(f"{path}/orders_split.json", 'r', encoding='utf-8') as f:
+                order_data = json.load(f)
+            self.loader.load_extracted_data(order_data, 'orders')
+
+        # 2. Load Invoices (Header + Detail + Payment)
+        if os.path.exists(f"{path}/invoices_split.json"):
+            with open(f"{path}/invoices_split.json", 'r', encoding='utf-8') as f:
+                invoice_data = json.load(f)
+            self.loader.load_extracted_data(invoice_data, 'invoices')
+        
+        # Dọn dẹp folder sau khi nạp xong
+        if os.path.exists(path):
+            shutil.rmtree(path)
+            logger.info(f"🧹 Cleaned up {path}")-e 
+
+========================================
+FILE: ./dags/repos/src/extractors/cukcuk/extractor.py
+========================================
+import logging
+import asyncio
+import aiohttp
+from aiohttp import TCPConnector, ClientTimeout
+import random
+from typing import List, Dict, Optional, Union, Any
+from datetime import datetime, timezone
+import dateutil.parser
+
+from .auth import CukCukAuth
+
+logger = logging.getLogger(__name__)
+
+class CukCukExtractor:
+    _cached_token = None
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.base_url = config.get("CukCuk-Base-URL", "https://graphapi.cukcuk.com/api")
+        self.company_code = config.get("CompanyCode", "uraeteicambodia")
+        self.branch_map = config.get("Branch-Name_Mapper", {})
+        self.branch_id = list(self.branch_map.keys())[0] if self.branch_map else ""
+
+        self.semaphore = asyncio.Semaphore(5)
+        self.max_retries = 5
+        self.base_delay = 1.0
+        self.auth_handler = CukCukAuth(config)
+
+    def _get_valid_token(self):
+        if CukCukExtractor._cached_token:
+            return CukCukExtractor._cached_token
+        try:
+            token = self.auth_handler.get_token()
+            CukCukExtractor._cached_token = token
+            return token
+        except Exception as e:
+            logger.critical(f"Auth Failed: {e}")
+            raise e
+
+    async def _call_api_async(self, session: aiohttp.ClientSession, url: str, method: str = "GET", 
+                             json_body: dict = None, params: dict = None) -> Dict:
+        token = self._get_valid_token()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "CompanyCode": self.company_code
+        }
+        RETRY_CODES = [429, 500, 502, 503, 504, 520, 525]
+
+        async with self.semaphore:
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            last_exception = None
+            for attempt in range(self.max_retries):
+                try:
+                    async with session.request(method, url, json=json_body, params=params, headers=headers) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        elif response.status == 401:
+                            CukCukExtractor._cached_token = None
+                            token = self._get_valid_token()
+                            headers["Authorization"] = f"Bearer {token}"
+                            continue
+                        elif response.status in RETRY_CODES:
+                            sleep_time = self.base_delay * (2 ** attempt) + random.uniform(0, 1)
+                            await asyncio.sleep(sleep_time)
+                        else:
+                            text = await response.text()
+                            raise Exception(f"API Error {response.status}: {text[:200]}")
+                except Exception as e:
+                    last_exception = e
+                    await asyncio.sleep(self.base_delay * (2 ** attempt))
+            
+            raise Exception(f"Failed {url} after retries. Last error: {last_exception}")
+
+    def _parse_date_safe(self, date_val: Union[str, datetime]) -> datetime:
+        if isinstance(date_val, datetime):
+            return date_val.replace(tzinfo=timezone.utc) if date_val.tzinfo is None else date_val
+        if not date_val:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            dt = dateutil.parser.parse(date_val)
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        except:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    # =========================================================================
+    # 1. EXTRACT ORDERS (Tách Header & Detail)
+    # =========================================================================
+    async def extract_orders(self, from_date: str, to_date: datetime = None) -> Dict[str, List[Dict]]:
+        all_headers = []
+        all_details = []
+        limit = 100
+        endpoint = self.config.get("Get-OrderHeader-URL", "/v1/orders/paging")
+        url = f"{self.base_url}{endpoint}"
+        detail_endpoint = self.config.get("Get-OrderDetail-URL", "/v1/orders/")
+        
+        cutoff_date = self._parse_date_safe(to_date) if to_date else None
+        logger.info(f"📦 [ASYNC] Extracting ORDERS & DETAILS from: {from_date}")
+
+        async with aiohttp.ClientSession(connector=TCPConnector(limit=0), timeout=ClientTimeout(total=900)) as session:
+            current_page = 1
+            is_finished = False
+            
+            while not is_finished:
+                header_tasks = []
+                for i in range(5): # BATCH_SIZE = 5
+                    payload = {"Page": current_page + i, "Limit": limit, "BranchId": self.branch_id, "LastSyncDate": from_date}
+                    header_tasks.append(self._call_api_async(session, url, method="POST", json_body=payload))
+                
+                header_results = await asyncio.gather(*header_tasks)
+                
+                valid_headers_in_batch = []
+                for res in header_results:
+                    data_page = res.get("Data", [])
+                    if not data_page:
+                        is_finished = True
+                        break
+                    
+                    for item in data_page:
+                        item_dt = self._parse_date_safe(item.get("Date"))
+                        if not cutoff_date or item_dt < cutoff_date:
+                            valid_headers_in_batch.append(item)
+                    
+                    if len(data_page) < limit: is_finished = True
+
+                # Fetch Details for batch
+                if valid_headers_in_batch:
+                    detail_tasks = []
+                    for order in valid_headers_in_batch:
+                        oid = order.get("Id")
+                        detail_tasks.append(self._call_api_async(session, f"{self.base_url}{detail_endpoint}{oid}"))
+                    
+                    details_results = await asyncio.gather(*detail_tasks)
+
+                    for order, raw_detail_resp in zip(valid_headers_in_batch, details_results):
+                        # 1. Add Header
+                        all_headers.append(order)
+                        
+                        # 2. Add Details
+                        content = raw_detail_resp.get("Data", [])
+                        line_items = content.get("OrderDetails", []) if isinstance(content, dict) else (content if isinstance(content, list) else [])
+                        
+                        for det in line_items:
+                            det.update({
+                                "order_id": order.get("Id"), 
+                                "report_date": order.get("Date")[:10] if order.get("Date") else None
+                            })
+                            all_details.append(det)
+                
+                if not is_finished: current_page += 5
+        
+        return {"headers": all_headers, "details": all_details}
+
+    # =========================================================================
+    # 2. EXTRACT INVOICES (Tách Header, Detail, Payment)
+    # =========================================================================
+    async def extract_invoices(self, from_date: str, to_date: datetime = None) -> Dict[str, List[Dict]]:
+        all_headers = []
+        all_details = []
+        all_payments = []
+        limit = 100
+        url = f"{self.base_url}{self.config.get('Get-SAInvoiceHeader-URL', '/v1/sainvoices/paging')}"
+        detail_base = f"{self.base_url}{self.config.get('Get-SAInvoiceDetail-URL', '/v1/sainvoices/')}"
+        
+        cutoff_date = self._parse_date_safe(to_date) if to_date else None
+        logger.info(f"🧾 [ASYNC] Extracting INVOICES, DETAILS & PAYMENTS from: {from_date}")
+
+        async with aiohttp.ClientSession(connector=TCPConnector(limit=0), timeout=ClientTimeout(total=900)) as session:
+            current_page = 1
+            is_finished = False
+            
+            while not is_finished:
+                header_tasks = [self._call_api_async(session, url, method="POST", 
+                               json_body={"Page": current_page + i, "Limit": limit, "IncludeInactive": True, "LastSyncDate": from_date}) 
+                               for i in range(5)]
+                
+                header_results = await asyncio.gather(*header_tasks)
+                
+                valid_headers_in_batch = []
+                for res in header_results:
+                    data_page = res.get("Data", [])
+                    if not data_page:
+                        is_finished = True
+                        break
+                    for item in data_page:
+                        item_dt = self._parse_date_safe(item.get("RefDate") or item.get("CreatedDate"))
+                        if not cutoff_date or item_dt < cutoff_date:
+                            valid_headers_in_batch.append(item)
+                    if len(data_page) < limit: is_finished = True
+
+                if valid_headers_in_batch:
+                    detail_tasks = [self._call_api_async(session, f"{detail_base}{h.get('RefId')}") for h in valid_headers_in_batch]
+                    results = await asyncio.gather(*detail_tasks)
+
+                    for header, res in zip(valid_headers_in_batch, results):
+                        all_headers.append(header)
+                        
+                        detail_data = res.get("Data", {})
+                        ref_id = header.get("RefId")
+                        report_date = header.get("ReportDate")
+
+                        # Phẳng hóa Details
+                        for d in detail_data.get("SAInvoiceDetails", []):
+                            d.update({"ref_id": ref_id, "report_date": report_date})
+                            all_details.append(d)
+                        
+                        # Phẳng hóa Payments
+                        for p in detail_data.get("SAInvoicePayments", []):
+                            p.update({"ref_id": ref_id, "report_date": report_date})
+                            all_payments.append(p)
+
+                if not is_finished: current_page += 5
+        
+        return {"headers": all_headers, "details": all_details, "payments": all_payments}
+
+    # =========================================================================
+    # 3. MASTER DATA (PRODUCTS / CUSTOMERS)
+    # =========================================================================
+    async def _extract_master_data(self, endpoint_key: str, default_url: str, name: str) -> List[Dict]:
+        all_items = []
+        url = f"{self.base_url}{self.config.get(endpoint_key, default_url)}"
+        logger.info(f"📚 [ASYNC] Extracting {name}...")
+
+        async with aiohttp.ClientSession(connector=TCPConnector(limit=0), timeout=ClientTimeout(total=900)) as session:
+            current_page = 1
+            is_finished = False
+            while not is_finished:
+                tasks = [self._call_api_async(session, url, method="POST", 
+                         json_body={"Page": current_page + i, "Limit": 100, "IncludeInactive": True, 
+                                    "BranchId": "00000000-0000-0000-0000-000000000000", "LastSyncDate": "2010-01-01T00:00:00Z"}) 
+                         for i in range(5)]
+                results = await asyncio.gather(*tasks)
+                for res in results:
+                    data = res.get("Data", [])
+                    if data:
+                        all_items.extend(data)
+                        if len(data) < 100: is_finished = True
+                    else:
+                        is_finished = True
+                if not is_finished: current_page += 5
+        return all_items
+
+    async def extract_products(self) -> List[Dict]:
+        return await self._extract_master_data("Get-Product-URL", "/v1/inventoryitems/paging", "PRODUCTS")
+
+    async def extract_customers(self) -> List[Dict]:
+        return await self._extract_master_data("Get-Customer-URL", "/v1/customers/paging", "CUSTOMERS")-e 
+
+========================================
+FILE: ./dags/repos/src/extractors/cukcuk/auth.py
+========================================
+import hashlib
+import hmac
+import json
+import datetime
+import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
+class CukCukAuth:
+    def __init__(self, config: dict):
+        self.config = config
+        self.app_id = config.get("AppID")
+        self.secret_key = config.get("secret_key")
+        self.domain = config.get("Domain")
+        
+        base_url = config.get("CukCuk-Base-URL", "https://graphapi.cukcuk.com/api").rstrip("/")
+        token_endpoint = config.get("Get-Token-URL", "/Account/Login")
+        
+        self.login_url = f"{base_url}{token_endpoint}"
+        
+        logger.info(f"Auth URL configured: {self.login_url}") 
+
+    def _generate_signature(self, login_time_str: str) -> str:
+        raw_data = {
+            "AppID": self.app_id,
+            "Domain": self.domain,
+            "LoginTime": login_time_str
+        }
+        
+        json_str = json.dumps(raw_data, separators=(',', ':'))
+        
+        signature = hmac.new(
+            self.secret_key.encode('ascii'), 
+            json_str.encode('utf-8'), 
+            hashlib.sha256
+        ).hexdigest()
+        
+        return signature
+
+    def get_token(self) -> str:
+        """
+        Call API to get Access Token
+        """
+        now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        signature = self._generate_signature(now_utc)
+        
+        payload = {
+            "AppID": self.app_id,
+            "Domain": self.domain,
+            "LoginTime": now_utc,
+            "SignatureInfo": signature
+        }
+        
+        headers = {'Content-Type': 'application/json'}
+        
+        try:
+            response = requests.post(self.login_url, json=payload, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                resp_json = response.json()
+                token = resp_json.get("Data", {}).get("AccessToken")
+                if token:
+                    logger.info("✅ Authentication successful. Token retrieved.")
+                    return token
+                else:
+                    logger.error(f"Auth failed. No token in response. Body: {resp_json}")
+            else:
+                logger.error(f"❌ Auth failed. Status: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Error during authentication: {e}")
+            
+        raise Exception("Failed to retrieve Access Token from CukCuk")-e 
+
+========================================
+FILE: ./dags/repos/src/extractors/cukcuk/__init__.py
+========================================
+-e 
+
+========================================
+FILE: ./dags/repos/src/utils/ssm_loader.py
+========================================
+import boto3
+import logging
+import json
+import os
+
+logger = logging.getLogger(__name__)
+
+class SSMParameterLoader:
+    def __init__(self, region_name="ap-southeast-2"):
+        self.region = region_name
+        try:
+            self.client = boto3.client('ssm', region_name=self.region)
+        except Exception as e:
+            logger.error(f"Failed to connect to AWS SSM: {e}")
+            self.client = None
+
+    def get_parameter(self, param_name, required=True):
+        if not self.client:
+            if required: raise Exception("AWS SSM Client not initialized")
+            return None
+        try:
+            response = self.client.get_parameter(
+                Name=param_name,
+                WithDecryption=True
+            )
+            return response['Parameter']['Value']
+        except Exception as e:
+            logger.error(f"Error fetching {param_name}: {e}")
+            if required: raise e
+            return None
+
+    def merge_ssm_config(self, config: dict, param_path="/uratei_etl_config"):
+        logger.info(f"Fetching config JSON from SSM: {param_path}...")
+        try:
+            json_str = self.get_parameter(param_path, required=True)
+            ssm_values = json.loads(json_str)
+            config.update(ssm_values)
+            logger.info("Successfully merged secrets from AWS SSM.")
+        except Exception as e:
+            logger.critical(f"Failed to load SSM config: {e}")
+            raise e
+        return config
+
+def load_config(config_path=None):
+    if not config_path:
+        current_dir = os.path.dirname(__file__)
+        config_path = os.path.abspath(
+            os.path.join(current_dir, "../../../../configs/config.json")
+        )
+
+    logger.info(f"📂 Loading config from: {config_path}")
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"❌ Config file not found at: {config_path}")
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    try:
+        loader = SSMParameterLoader()
+        config = loader.merge_ssm_config(config)
+    except Exception as e:
+        logger.warning(f"⚠️ SSM Merge failed (using local config only): {e}")
+
+    return config-e 
+
+========================================
+FILE: ./dags/repos/src/utils/slack_alert.py
+========================================
+import logging
+import json
+import requests
+import traceback
+from datetime import datetime
+from airflow.hooks.base import BaseHook
+
+logger = logging.getLogger(__name__)
+
+class SlackAlert:
+    def __init__(self, config: dict):
+        self.webhook_url = config.get("Slack-Webhook-URL")
+        self.env = config.get("Environment", "Production")
+        self.enabled = bool(self.webhook_url)
+
+        # Configure Bot name and Icon here
+        self.bot_name = "ETL Pipeline Report" 
+        self.bot_icon = ":chart_with_upwards_trend:"
+
+        if not self.enabled:
+            logger.warning("Slack Webhook URL not found. Alert is disabled.")
+
+    def _send_payload(self, payload: dict):
+        if not self.enabled: return
+        
+        try:
+            payload["username"] = self.bot_name
+            payload["icon_emoji"] = self.bot_icon
+            
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(self.webhook_url, data=json.dumps(payload), headers=headers, timeout=10)
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to send Slack alert. Status: {response.status_code}, Resp: {response.text}")
+        except Exception as e:
+            logger.error(f"Exception sending Slack alert: {e}")
+
+    def send_success(self, message: str, duration: str = None):
+        if not self.enabled: return
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "✅ ETL Pipeline Success",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Environment:*\n{self.env}"},
+                    {"type": "mrkdwn", "text": f"*Time:*\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
+                ]
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Message:*\n{message}"}
+            }
+        ]
+        
+        if duration:
+            blocks[1]["fields"].append({"type": "mrkdwn", "text": f"*Duration:*\n{duration}"})
+
+        payload = {
+            "attachments": [
+                {
+                    "color": "#36a64f",
+                    "blocks": blocks
+                }
+            ]
+        }
+        self._send_payload(payload)
+
+    def send_error(self, error_msg: str, error_obj: Exception = None):
+        if not self.enabled: return
+
+        tb_str = ""
+        if error_obj:
+            tb_str = "".join(traceback.format_exception(None, error_obj, error_obj.__traceback__))
+            if len(tb_str) > 1500: tb_str = tb_str[-1500:]
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🚨 ETL Pipeline FAILED",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Environment:*\n{self.env}"},
+                    {"type": "mrkdwn", "text": f"*Time:*\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
+                ]
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Error Summary:*\n{error_msg}"}
+            }
+        ]
+
+        if tb_str:
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Traceback:*\n```{tb_str}```"}
+            })
+
+        payload = {
+            "attachments": [
+                {
+                    "color": "#ff0000",
+                    "blocks": blocks
+                }
+            ]
+        }
+        self._send_payload(payload)
+    
+def task_fail_slack_alert(context):
+    """
+    Hàm này đóng vai trò cầu nối:
+    1. Lấy Webhook từ Airflow Connection ('slack_conn').
+    2. Lấy thông tin lỗi từ Airflow Context.
+    3. Gọi class SlackAlert để bắn tin nhắn đi.
+    """
+    try:
+        # 1. Lấy Webhook URL từ Connection mà bạn đã tạo trên UI
+        # (Lưu ý: Nếu bạn lưu URL trong ô Password thì dùng conn.password, nếu Host thì dùng conn.host)
+        conn = BaseHook.get_connection('slack_conn')
+        webhook_url = conn.password if conn.password else conn.host
+        
+        if not webhook_url:
+            logger.warning("⚠️ No Slack Webhook found in connection 'slack_conn'.")
+            return
+
+        # 2. Tạo config giả lập để khởi tạo Class SlackAlert
+        config = {
+            "Slack-Webhook-URL": webhook_url,
+            "Environment": "Airflow Production"
+        }
+        
+        # 3. Lấy thông tin task bị lỗi
+        ti = context.get('task_instance')
+        exception = context.get('exception')
+        dag_id = ti.dag_id
+        task_id = ti.task_id
+        log_url = ti.log_url
+        
+        # Tạo nội dung thông báo
+        error_msg = (
+            f"🔴 *Task Failed!*\n"
+            f"• *DAG:* `{dag_id}`\n"
+            f"• *Task:* `{task_id}`\n"
+            f"• *Logs:* <{log_url}|Click here to view logs>"
+        )
+
+        # 4. Gửi Alert
+        alerter = SlackAlert(config)
+        alerter.send_error(error_msg=error_msg, error_obj=exception)
+        
+    except Exception as e:
+        logger.error(f"Failed to send Airflow Slack Alert: {e}")-e 
+
+========================================
+FILE: ./dags/repos/src/transformers/generic_transformer.py
+========================================
+import pandas as pd
+import logging
+from typing import List, Dict
+
+logger = logging.getLogger(__name__)
+
+class GenericTransformer:
+    def __init__(self, config: dict):
+        self.config = config
+        self.branch_map = config.get("Branch-Name_Mapper", {})
+
+    def transform(self, raw_data: List[Dict], table_name: str) -> pd.DataFrame:
+        if not raw_data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(raw_data)
+        
+        # 1. ENRICHMENT: Map tên chi nhánh
+        if "BranchId" in df.columns and self.branch_map:
+            clean_map = {str(k).strip().lower(): v for k, v in self.branch_map.items()}
+            # Tạo cột BranchName từ BranchId
+            df["BranchName"] = df["BranchId"].astype(str).str.strip().str.lower().map(clean_map)
+            # Nếu không map được thì giữ nguyên ID cũ để không bị mất dữ liệu
+            df["BranchName"] = df["BranchName"].fillna(df["BranchId"])
+
+        # 2. MAPPING & FILTERING
+        mapper = self.config.get("Column-Renaming", {}).get(table_name)
+        if mapper:
+            # Xác định những cột cần giữ lại: Cột trong Mapper + Cột BranchName vừa tạo
+            cols_to_keep = [col for col in df.columns if col in mapper.keys()]
+            if "BranchName" in df.columns:
+                cols_to_keep.append("BranchName")
+            
+            # Lọc dataframe
+            df = df[list(set(cols_to_keep))] # Dùng set để tránh trùng lặp cột
+            
+            # Đổi tên các cột API sang snake_case
+            df = df.rename(columns=mapper)
+        else:
+            logger.warning(f"⚠️ No mapping found for {table_name}. Sending raw columns to Snowflake.")
+
+        return df-e 
+
+========================================
+FILE: ./dags/repos/src/__init__.py
+========================================
+-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/tests/assert_order_date_not_in_future.sql
+========================================
+-- report_date không được lớn hơn ngày hiện tại
+SELECT *
+FROM {{ ref('stg_order_header') }}
+WHERE report_date > CURRENT_DATE()
+-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/tests/assert_revenue_positive.sql
+========================================
+SELECT *
+FROM {{ ref('master_sales_analytics') }}
+WHERE net_revenue_inclusive < 0-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/marts/schema.yml
+========================================
+version: 2
+
+models:
+  - name: master_sales_analytics
+    description: "Bảng phân tích doanh thu tổng hợp (Marts). Dữ liệu đã được làm sạch và Incremental theo ngày."
+    columns:
+      - name: order_id
+        description: "Mã định danh đơn hàng."
+        tests:
+          - not_null
+
+      - name: item_id
+        description: "Mã định danh món ăn trong đơn hàng."
+        tests:
+          - not_null
+
+      - name: report_date
+        description: "Ngày báo cáo doanh thu. Dùng cột này để Partition và Filter."
+        tests:
+          - not_null
+
+      - name: net_revenue_inclusive
+        description: "Doanh thu tổng sau thuế (Gross Revenue). Công thức = Amount - Giảm giá + Thuế."
+        tests:
+          - not_null
+
+      - name: customer_id
+        description: "ID khách hàng. (Lưu ý: Tên và SĐT đã bị ẩn danh hóa ở tầng Staging)."-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/marts/revenue_daily.sql
+========================================
+{{ config(materialized='table') }}
+
+WITH sales AS (
+    SELECT * FROM {{ ref('stg_invoice_header') }}
+),
+
+detail AS (
+    SELECT * FROM {{ ref('stg_invoice_detail') }}
+),
+
+joined AS (
+    SELECT
+        s.report_date,
+        s.branch_name,
+        -- Đảm bảo lấy đúng cột từ bảng Staging Header
+        s.year, 
+        s.month,
+        s.ref_id,
+        (d.amount 
+         - COALESCE(d.allocation_amount, 0) 
+         - COALESCE(d.allocation_delivery_promotion_amount, 0)
+         + COALESCE(d.tax_amount, 0)
+        ) AS order_revenue
+    FROM sales s
+    JOIN detail d ON s.ref_id = d.ref_id
+    -- Logic: Loại bỏ đơn hủy (4), giữ lại các đơn trạng thái khác (1, 2, 3)
+    WHERE s.payment_status != 4
+)
+
+SELECT
+    report_date,
+    branch_name,
+    year,
+    month,
+    COUNT(DISTINCT ref_id)          AS total_orders,
+    SUM(order_revenue)              AS total_revenue,
+    CASE
+        WHEN COUNT(DISTINCT ref_id) > 0
+        THEN SUM(order_revenue) / COUNT(DISTINCT ref_id)
+        ELSE 0
+    END                             AS aov
+FROM joined
+-- Chỉ lấy những đơn có doanh thu thực tế
+WHERE order_revenue > 0
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/marts/master_sales_analytics.sql
+========================================
+{{ config(
+    materialized='incremental',
+    alias='view_master_sales_analytics',
+    incremental_strategy='merge',
+    unique_key=['order_id', 'item_id'],
+    cluster_by=['year', 'month']
+) }}
+
+WITH header AS (
+    SELECT * FROM {{ ref('stg_invoice_header') }}
+    {% if is_incremental() %}
+        -- Lọc dữ liệu mới để nạp thêm (Incremental)
+        WHERE ref_date_at >= DATEADD('day', -{{ var('backfill_days', 3) }}, CURRENT_DATE())
+    {% endif %}
+),
+
+detail AS (
+    SELECT * FROM {{ ref('stg_invoice_detail') }}
+    WHERE item_id IS NOT NULL 
+),
+
+final AS (
+    SELECT
+        h.branch_name,
+        h.ref_id                                        AS order_id,
+        h.ref_no                                        AS invoice_code,
+        h.customer_id,
+        d.item_name,
+        d.item_id,
+        h.ref_date_at                                   AS ref_date, 
+        h.report_date,
+        TO_VARCHAR(h.ref_date_at, 'HH24')               AS report_hour,
+        h.day,
+        h.month,
+        h.year,
+        d.quantity,
+        (d.amount
+         - COALESCE(d.allocation_amount, 0)
+         - COALESCE(d.allocation_delivery_promotion_amount, 0)
+        )                                               AS net_revenue_pre_tax,
+        COALESCE(d.tax_amount, 0)                       AS tax_amount,
+        (d.amount
+         - COALESCE(d.allocation_amount, 0)
+         - COALESCE(d.allocation_delivery_promotion_amount, 0)
+         + COALESCE(d.tax_amount, 0)
+        )                                               AS net_revenue_inclusive
+    FROM detail d
+    JOIN header h ON d.ref_id = h.ref_id
+    -- 🚨 SỬA TẠI ĐÂY: Lấy các hóa đơn đã thanh toán (thường là status 4)
+    -- Nếu muốn lấy tất cả, bạn có thể comment dòng này lại bằng --
+    WHERE h.payment_status != 4
+)
+
+-- CHỈ DÙNG 1 LỆNH SELECT Ở ĐÂY
+SELECT * FROM final
+{% if is_incremental() %}
+    -- Tránh lỗi so sánh với NULL khi bảng rỗng lần đầu
+    AND report_date >= (SELECT COALESCE(MAX(report_date), '2020-01-01') FROM {{ this }})
+{% endif %}-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/marts/customer_retention.sql
+========================================
+-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_customer.sql
+========================================
+{{ config(materialized='view') }}
+
+WITH source AS (
+    SELECT RAW_DATA, INGESTED_AT 
+    FROM {{ source('cukcuk', 'customer_raw') }}
+),
+
+filtered_source AS (
+    SELECT * FROM source
+    WHERE 
+        -- 1. Lọc SQL NULL
+        RAW_DATA:customer_id IS NOT NULL 
+        -- 2. Lọc JSON null (Đặc thù Snowflake Variant)
+        AND NOT IS_NULL_VALUE(RAW_DATA:customer_id)
+        -- 3. Lọc chuỗi rỗng hoặc chuỗi có chữ 'null'
+        AND TRIM(CAST(RAW_DATA:customer_id AS VARCHAR)) <> ''
+        AND LOWER(CAST(RAW_DATA:customer_id AS VARCHAR)) <> 'null'
+),
+
+parsed AS (
+    SELECT
+        TRIM(CAST(RAW_DATA:customer_id AS VARCHAR))   AS customer_id,
+        TRIM(CAST(RAW_DATA:customer_name AS VARCHAR)) AS customer_name,
+        CAST(RAW_DATA:customer_code AS VARCHAR(50))   AS customer_code,
+        CAST(RAW_DATA:customer_tel AS VARCHAR)        AS customer_tel,
+        COALESCE(RAW_DATA:report_date::DATE, INGESTED_AT::DATE) AS report_date,
+        INGESTED_AT
+    FROM filtered_source
+),
+
+deduplicated AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id 
+            ORDER BY INGESTED_AT DESC
+        ) AS row_num
+    FROM parsed
+)
+
+SELECT
+    customer_id,
+    customer_code,
+    {{ hash_pii("customer_name") }} AS customer_name_hashed,
+    {{ hash_pii("customer_tel") }}  AS customer_tel_hashed,
+    report_date,
+    INGESTED_AT
+FROM deduplicated
+WHERE row_num = 1 
+  -- Chốt chặn cuối cùng cho chắc chắn pass bài test dbt
+  AND customer_id IS NOT NULL 
+  AND customer_name IS NOT NULL-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_order_header.sql
+========================================
+{{ config(materialized='view') }}
+
+WITH source AS (
+    SELECT RAW_DATA, INGESTED_AT FROM {{ source('cukcuk', 'order_header_raw') }}
+),
+
+deduplicated AS (
+    SELECT 
+        RAW_DATA, 
+        INGESTED_AT,
+        ROW_NUMBER() OVER (
+            PARTITION BY RAW_DATA:order_id::VARCHAR 
+            ORDER BY INGESTED_AT DESC
+        ) AS row_num
+    FROM source
+)
+
+SELECT
+    RAW_DATA:order_id::VARCHAR(50)         AS order_id,
+    RAW_DATA:branch_name::VARCHAR(100)     AS branch_name,
+    RAW_DATA:brand_id::VARCHAR(50)         AS brand_id,
+    RAW_DATA:employee_id::VARCHAR(50)      AS employee_id,
+    RAW_DATA:order_status::INTEGER         AS status,
+    RAW_DATA:total_amount::FLOAT           AS total_amount,
+    
+    -- Parse Epoch microseconds sang Timestamp
+    TO_TIMESTAMP_NTZ(RAW_DATA:order_date::BIGINT / 1000000) AS order_date_at,
+    
+    -- Dùng report_date có sẵn trong JSON
+    RAW_DATA:report_date::DATE             AS report_date,
+    RAW_DATA:year::INTEGER                 AS year,
+    RAW_DATA:month::INTEGER                AS month,
+    RAW_DATA:day::INTEGER                  AS day,
+    
+    INGESTED_AT
+FROM deduplicated
+WHERE row_num = 1-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_customer.yml
+========================================
+version: 2
+
+models:
+  - name: stg_customer
+    description: "Bảng danh sách khách hàng đã được khử trùng và ẩn danh thông tin cá nhân."
+    columns:
+      - name: customer_id
+        description: "Mã định danh duy nhất của khách hàng."
+        tests:
+          - unique    # 🚨 Kiểm tra: Không được phép có 2 dòng trùng ID
+          - not_null  # 🚨 Kiểm tra: ID không được phép để trống
+          
+      - name: report_date
+        description: "Ngày ghi nhận khách hàng từ hệ thống."
+        tests:
+          - not_null
+
+      - name: customer_name_hashed
+        description: "Tên khách hàng đã được mã hóa MD5."
+        tests:
+          - not_null-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_product.sql
+========================================
+{{ config(materialized='view') }}
+
+WITH source AS (
+    SELECT 
+        RAW_DATA, 
+        INGESTED_AT,
+        ROW_NUMBER() OVER (PARTITION BY RAW_DATA:product_id::VARCHAR ORDER BY INGESTED_AT DESC) AS row_num
+    FROM {{ source('cukcuk', 'product_raw') }}
+)
+
+SELECT
+    RAW_DATA:product_id::VARCHAR(50)   AS product_id,
+    RAW_DATA:product_code::VARCHAR(50) AS product_code,
+    RAW_DATA:product_name::VARCHAR(200) AS product_name,
+    RAW_DATA:price::FLOAT              AS price,
+    -- Master data thường dùng ngày nạp nếu không có report_date
+    COALESCE(RAW_DATA:report_date::DATE, INGESTED_AT::DATE) AS report_date,
+    INGESTED_AT
+FROM source
+WHERE row_num = 1-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_invoice_payment.sql
+========================================
+{{ config(materialized='view') }}
+
+WITH source AS (
+    -- Trỏ trực tiếp vào bảng RAW_INVOICE_PAYMENT_JSON
+    SELECT RAW_DATA, INGESTED_AT 
+    FROM {{ source('cukcuk', 'invoice_payment_raw') }}
+)
+
+SELECT
+    -- Các key trong bảng Payment thường là:
+    RAW_DATA:ref_id::VARCHAR(50)         AS ref_id,
+    RAW_DATA:payment_method::VARCHAR(50) AS payment_method,
+    RAW_DATA:amount::FLOAT               AS amount,
+    
+    -- Đồng bộ ngày báo cáo
+    RAW_DATA:report_date::DATE           AS report_date,
+    INGESTED_AT
+FROM source
+WHERE RAW_DATA:ref_id IS NOT NULL-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/sources.yml
+========================================
+version: 2
+
+sources:
+  - name: cukcuk
+    database: RESTAURANT_DB
+    schema: BRONZE
+    loader: snowflake_python_loader # Ghi chú để team biết ai đẩy data vào
+    
+    tables:
+      - name: invoice_header_raw
+        identifier: RAW_INVOICE_HEADER_JSON
+      
+      - name: invoice_detail_raw
+        identifier: RAW_INVOICE_DETAIL_JSON
+      
+      - name: invoice_payment_raw
+        identifier: RAW_INVOICE_PAYMENT_JSON
+      
+      - name: customer_raw
+        identifier: RAW_CUSTOMER_JSON
+      
+      - name: product_raw
+        identifier: RAW_PRODUCT_JSON
+      
+      - name: order_header_raw
+        identifier: RAW_ORDER_HEADER_JSON
+      
+      - name: order_detail_raw
+        identifier: RAW_ORDER_DETAIL_JSON-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_invoice_detail.sql
+========================================
+{{ config(materialized='view') }}
+
+WITH source AS (
+    SELECT RAW_DATA, INGESTED_AT 
+    FROM {{ source('cukcuk', 'invoice_detail_raw') }}
+)
+
+SELECT
+    RAW_DATA:ref_id::VARCHAR(50)           AS ref_id,
+    RAW_DATA:ref_detail_id::VARCHAR(50)    AS ref_detail_id,
+    RAW_DATA:item_id::VARCHAR(50)          AS item_id,
+    RAW_DATA:item_name::VARCHAR(200)       AS item_name,
+    RAW_DATA:quantity::FLOAT               AS quantity,
+    RAW_DATA:amount::FLOAT                 AS amount,
+    COALESCE(RAW_DATA:tax_amount::FLOAT, 0) AS tax_amount,
+    COALESCE(RAW_DATA:allocation_amount::FLOAT, 0) AS allocation_amount,
+    
+    -- 🚨 THÊM CỘT NÀY ĐỂ HẾT LỖI MASTER_SALES_ANALYTICS
+    COALESCE(RAW_DATA:allocation_delivery_promotion_amount::FLOAT, 0) AS allocation_delivery_promotion_amount,
+    
+    RAW_DATA:report_date::DATE             AS report_date,
+    INGESTED_AT
+FROM source
+WHERE RAW_DATA:ref_id IS NOT NULL-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_order_detail.sql
+========================================
+{{ config(materialized='view') }}
+
+WITH source AS (
+    -- Trỏ trực tiếp vào bảng RAW_ORDER_DETAIL_JSON thông qua identifier trong sources.yml
+    SELECT RAW_DATA, INGESTED_AT 
+    FROM {{ source('cukcuk', 'order_detail_raw') }}
+)
+
+SELECT
+    -- Sửa lại các key cho đúng với thực tế trong bảng Detail
+    RAW_DATA:order_id::VARCHAR(50)         AS order_id,
+    RAW_DATA:order_detail_id::VARCHAR(50)  AS order_detail_id,
+    RAW_DATA:item_id::VARCHAR(50)          AS item_id,
+    RAW_DATA:item_name::VARCHAR(200)       AS item_name,
+    RAW_DATA:quantity::FLOAT               AS quantity,
+    RAW_DATA:price::FLOAT                  AS price,
+    RAW_DATA:amount::FLOAT                 AS amount,
+    
+    -- Đồng bộ ngày báo cáo
+    RAW_DATA:report_date::DATE             AS report_date,
+    INGESTED_AT
+FROM source
+WHERE RAW_DATA:order_id IS NOT NULL-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_invoice_header.sql
+========================================
+{{ config(materialized='view') }}
+
+WITH source AS (
+    SELECT RAW_DATA, INGESTED_AT FROM {{ source('cukcuk', 'invoice_header_raw') }}
+),
+
+deduplicated AS (
+    SELECT 
+        RAW_DATA, 
+        INGESTED_AT,
+        ROW_NUMBER() OVER (
+            PARTITION BY RAW_DATA:ref_id::VARCHAR 
+            ORDER BY INGESTED_AT DESC
+        ) AS row_num
+    FROM source
+)
+
+SELECT
+    RAW_DATA:ref_id::VARCHAR(50)           AS ref_id,
+    RAW_DATA:ref_no::VARCHAR(50)           AS ref_no,
+    RAW_DATA:branch_name::VARCHAR(100)     AS branch_name,
+    RAW_DATA:payment_status::INTEGER       AS payment_status,
+    RAW_DATA:total_amount::FLOAT           AS total_amount,
+    RAW_DATA:customer_id::VARCHAR(50)      AS customer_id,
+
+    -- Xử lý Year/Month từ report_date cho chắc chắn
+    COALESCE(RAW_DATA:year::INTEGER, YEAR(RAW_DATA:report_date::DATE))   AS year,
+    COALESCE(RAW_DATA:month::INTEGER, MONTH(RAW_DATA:report_date::DATE)) AS month,
+    RAW_DATA:day::INTEGER                                               AS day,
+    
+    -- 🚨 SỬA TẠI ĐÂY: Xử lý linh hoạt cả String và Epoch BigInt
+    CASE 
+        WHEN IS_INTEGER(RAW_DATA:ref_date) 
+        THEN TO_TIMESTAMP_NTZ(RAW_DATA:ref_date::BIGINT / 1000000)
+        ELSE TRY_TO_TIMESTAMP(RAW_DATA:ref_date::VARCHAR)
+    END AS ref_date_at,
+
+    RAW_DATA:report_date::DATE             AS report_date,
+    INGESTED_AT
+FROM deduplicated
+WHERE row_num = 1-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/macros/hash_pii.sql
+========================================
+{% macro hash_pii(column_name) %}
+    MD5(CAST({{ column_name }} AS VARCHAR))
+{% endmacro %}-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/macros/generate_schema_name.sql
+========================================
+{% macro generate_schema_name(custom_schema_name, node) -%}
+    {%- if custom_schema_name is none -%}
+        {{ target.schema }}
+    {%- else -%}
+        {{ custom_schema_name | trim }}
+    {%- endif -%}
+{%- endmacro %}-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/.user.yml
+========================================
+id: 24ad484a-72f0-47df-b39f-96b8134c1adf
+-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/dbt_project.yml
+========================================
+name: 'restaurant_analytics'
+version: '1.0.0'
+profile: 'restaurant_snowflake'
+model-paths: ["models"]
+
+models:
+  restaurant_analytics:
+    staging:
+      +materialized: view
+      +schema: SILVER
+    marts:
+      +materialized: table
+      +schema: GOLD
+-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/profiles.yml
+========================================
+restaurant_snowflake:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      threads: 8
+      account: xlibfys-fwb58805
+      user: tuanle
+      password: Lethanhtuan97@!
+      role: DE_ROLE
+      database: RESTAURANT_DB
+      warehouse: RESTAURANT_ETL_WH
+      schema: BRONZE-e 
+
+========================================
+FILE: ./dags/repos/scripts/run_etl.py
+========================================
+import sys
+import os
+import argparse
+import asyncio
+import logging
+from datetime import datetime
+
+# ==============================================================================
+# 1. SETUP ĐƯỜNG DẪN IMPORT (QUAN TRỌNG)
+# ==============================================================================
+# Mục tiêu: Thêm thư mục 'repos' vào sys.path để có thể import 'src'
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) # .../dags/repos/scripts
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)              # .../dags/repos
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+# ==============================================================================
+# 2. IMPORT MODULES
+# ==============================================================================
+try:
+    # Import Pipeline Logic
+    from src.pipelines.cukcuk_pipeline import CukCukETLPipeline
+    
+    # Import Config Loader từ file ssm_loader.py bạn đã cung cấp
+    from src.utils.ssm_loader import load_config
+    
+except ImportError as e:
+    print(f"❌ Import Error: {e}")
+    print(f"Current sys.path: {sys.path}")
+    sys.exit(1)
+
+# Config Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("ETL_Runner")
+
+# ==============================================================================
+# 3. MAIN FUNCTION
+# ==============================================================================
+def main():
+    # --- A. Parse Arguments ---
+    parser = argparse.ArgumentParser(description="Run CukCuk ETL Pipeline via CLI")
+    
+    parser.add_argument(
+        "--phase", 
+        required=True, 
+        choices=['master', 'trans'],
+        help="Phase to run: 'master' or 'trans'"
+    )
+    parser.add_argument(
+        "--step", 
+        required=True, 
+        choices=['extract', 'load'],
+        help="Step to run: 'extract' or 'load'"
+    )
+    parser.add_argument(
+        "--date", 
+        help="Target date in YYYY-MM-DD format (Required for 'trans' phase)"
+    )
+
+    args = parser.parse_args()
+
+    # --- B. Load Config & Init Pipeline ---
+    logger.info("🔧 Initializing Configuration...")
+    try:
+        # Gọi hàm load_config thực tế từ ssm_loader.py
+        # Lưu ý: Hàm này sẽ tự tìm config trong /opt/airflow/config/config.json 
+        # hoặc đường dẫn tương đối ../../../configs/config.json
+        config = load_config() 
+        
+        # Init Pipeline Class
+        pipeline = CukCukETLPipeline(config)
+        
+    except Exception as e:
+        logger.critical(f"❌ Failed to initialize Pipeline: {e}")
+        sys.exit(1)
+
+    # --- C. Router Logic ---
+    try:
+        # 1. NHÁNH MASTER DATA
+        if args.phase == 'master':
+            if args.step == 'extract':
+                logger.info("🚀 Starting MASTER EXTRACT...")
+                asyncio.run(pipeline.extract_master_to_disk())
+                
+            elif args.step == 'load':
+                logger.info("🚀 Starting MASTER LOAD...")
+                pipeline.load_master_from_disk_to_snowflake()
+
+        # 2. NHÁNH TRANSACTION DATA
+        elif args.phase == 'trans':
+            if not args.date:
+                logger.error("❌ Argument --date is required for transaction phase.")
+                sys.exit(1)
+            
+            target_date = datetime.strptime(args.date, "%Y-%m-%d")
+            
+            if args.step == 'extract':
+                logger.info(f"🚀 Starting TRANS EXTRACT for {args.date}...")
+                asyncio.run(pipeline.extract_trans_to_disk(target_date))
+                
+            elif args.step == 'load':
+                logger.info(f"🚀 Starting TRANS LOAD for {args.date}...")
+                pipeline.load_trans_from_disk_to_snowflake(target_date)
+
+        logger.info("✅ Job finished successfully.")
+
+    except Exception as e:
+        logger.error(f"❌ Job runtime failed: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()-e 
+
+========================================
+FILE: ./dags/repos/scripts/get_token.py
+========================================
+import hashlib
+import hmac
+import json
+import datetime
+import requests
+
+
+APP_ID = ""
+SECRET_KEY = ""     # Ví dụ: 123456...
+DOMAIN = ""             # Ví dụ: cukcuk.vn
+BASE_URL = "https://graphapi.cukcuk.com/api/Account/Login"
+# =======================================
+
+def get_token():
+    now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    raw_data = {"AppID": APP_ID, "Domain": DOMAIN, "LoginTime": now_utc}
+    json_str = json.dumps(raw_data, separators=(',', ':'))
+    signature = hmac.new(SECRET_KEY.encode('ascii'), json_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    payload = {
+        "AppID": APP_ID,
+        "Domain": DOMAIN,
+        "LoginTime": now_utc,
+        "SignatureInfo": signature
+    }
+    
+    try:
+        resp = requests.post(BASE_URL, json=payload)
+        print(f"Status: {resp.status_code}")
+        if resp.status_code == 200:
+            token = resp.json().get('Data', {}).get('AccessToken')
+            print("\n=== COPY TOKEN BÊN DƯỚI ===")
+            print(token)
+            return token
+        else:
+            print("Lỗi:", resp.text)
+    except Exception as e:
+        print(e)
+
+get_token()-e 
+
+========================================
+FILE: ./dags/weekly_backfill.py
+========================================
+import os
+import sys
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+
+# --- CẤU HÌNH ĐƯỜNG DẪN (Copy từ DAG chính sang) ---
+HOST_DBT_PATH = "/home/tuanle/DE-lab/data_pipeline_for_restaurant/dags/repos/dbt_project"
+AIRFLOW_INTERNAL_PATH = "/opt/airflow/dags/repos"
+ETL_SCRIPT_PATH = f"{AIRFLOW_INTERNAL_PATH}/scripts/run_etl.py"
+
+# --- MẶC ĐỊNH CONFIG ---
+# Khi chạy tự động (theo lịch), nó sẽ lấy giá trị này
+default_conf = {
+    "lookback_days": 7  # Mặc định quét lại 7 ngày gần nhất
+}
+
+default_args = {
+    'owner': 'tuanle',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    'maintenance_weekly_backfill',
+    default_args=default_args,
+    description='Chạy lại dữ liệu quá khứ để đảm bảo tính toàn vẹn (Self-healing)',
+    schedule_interval='0 3 * * 0', 
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=['maintenance', 'backfill'],
+    params=default_conf,
+) as dag:
+
+    # 1. Task Backfill (Giữ nguyên logic của bạn, rất tốt!)
+    t_backfill_loop = BashOperator(
+        task_id='backfill_extract_load',
+        bash_command=f"""
+        DAYS={{{{ params.lookback_days }}}}
+        echo "🔄 Bắt đầu Backfill cho $DAYS ngày gần nhất..."
+        
+        for i in $(seq $DAYS -1 1)
+        do
+            TARGET_DATE=$(date -d "-$i days" +%Y-%m-%d)
+            echo "------------------------------------------------"
+            echo "🚀 Processing Date: $TARGET_DATE"
+            
+            # Extract & Load Transaction
+            python3 {ETL_SCRIPT_PATH} --phase trans --step extract --date $TARGET_DATE
+            python3 {ETL_SCRIPT_PATH} --phase trans --step load --date $TARGET_DATE
+            
+            echo "✅ Done $TARGET_DATE"
+        done
+        """
+    )
+
+    # 2. Chạy dbt với tham số dynamic
+    t_dbt_run = BashOperator(
+    task_id='dbt_incremental_heal',
+    bash_command=(
+        f'cd {HOST_DBT_PATH} && '
+        'dbt build '
+        '--profiles-dir . '
+        '--project-dir . '
+        '--vars \'{"backfill_days": {{ params.lookback_days }}}\''
+    )
+)
+
+    t_backfill_loop >> t_dbt_run-e 
+
+========================================
+FILE: ./dags/restaurant_etl_dag.py
+========================================
+import os
+import sys
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+
+
+# 👇 1. THÊM ĐOẠN NÀY ĐỂ AIRFLOW TÌM THẤY FOLDER 'repos'
+dag_folder = os.path.dirname(__file__)
+repos_path = os.path.join(dag_folder, 'repos')
+if repos_path not in sys.path:
+    sys.path.append(repos_path)
+
+# 👇 2. GIỜ MỚI IMPORT ĐƯỢC
+try:
+    from src.utils.slack_alert import task_fail_slack_alert
+except ImportError:
+    # Fallback phòng hờ
+    from repos.src.utils.slack_alert import task_fail_slack_alert
+
+# --- CẤU HÌNH ĐƯỜNG DẪN ---
+AIRFLOW_INTERNAL_PATH = "/opt/airflow/dags/repos"
+HOST_DBT_PATH = "/home/tuanle/DE-lab/data_pipeline_for_restaurant/dags/repos/dbt_project"
+
+# Đường dẫn đến file script điều phối mới (bạn nhớ tạo file này như bước trước nhé)
+ETL_SCRIPT_PATH = f"{AIRFLOW_INTERNAL_PATH}/scripts/run_etl.py"
+
+default_args = {
+    'owner': 'tuanle',
+    'retries': 2, # Tăng lên 2 để nếu mạng lag thì tự thử lại
+    'retry_delay': timedelta(minutes=5),
+    'on_failure_callback': task_fail_slack_alert
+}
+
+with DAG(
+    'restaurant_elt_pipeline',
+    default_args=default_args,
+    description='Full ELT: Extract -> Snowflake -> dbt',
+    schedule_interval='0 8 * * *',
+    start_date=datetime(2024, 1, 20),
+    params={"manual_trigger": "yes"},
+    max_active_runs=1,
+    # max_active_tasks=1, # 👈 COMMENT DÒNG NÀY ĐỂ EXTRACT SONG SONG
+    catchup=False,
+    tags=['production', 'optimized'],
+) as dag:
+
+    # =================================================================
+    # GROUP 1: MASTER DATA (Product, Customer)
+    # =================================================================
+    
+    # 1.1. Extract (API -> Disk)
+    t_master_extract = BashOperator(
+        task_id='master_extract',
+        bash_command=f'python3 {ETL_SCRIPT_PATH} --phase master --step extract'
+    )
+
+    # 1.2. Load (Disk -> S3)
+    t_master_load = BashOperator(
+        task_id='master_load',
+        bash_command=f'python3 {ETL_SCRIPT_PATH} --phase master --step load'
+    )
+
+    # =================================================================
+    # GROUP 2: TRANSACTION DATA (Orders, Invoices)
+    # =================================================================
+
+    # 2.1. Extract (API -> Disk)
+    # {{ ds }} sẽ được Airflow thay thế bằng ngày chạy (YYYY-MM-DD)
+    t_trans_extract = BashOperator(
+        task_id='trans_extract',
+        bash_command=f'python3 {ETL_SCRIPT_PATH} --phase trans --step extract --date ' + '{{ ds }}'
+    )
+
+    # 2.2. Load (Disk -> S3)
+    t_trans_load = BashOperator(
+        task_id='trans_load',
+        bash_command=f'python3 {ETL_SCRIPT_PATH} --phase trans --step load --date ' + '{{ ds }}'
+    )
+
+    # =================================================================
+    # GROUP 3: TRANSFORM (dbt)
+    # =================================================================
+    
+    t_dbt_run = BashOperator(
+    task_id='dbt_run',
+    bash_command=(
+        f'cd {AIRFLOW_INTERNAL_PATH}/dbt_project && '
+        'dbt build '
+        '--profiles-dir . '
+        '--project-dir .'
+    )
+)
+
+    # =================================================================
+    # 🔗 THIẾT LẬP DEPENDENCIES (LUỒNG CHẠY)
+    # =================================================================
+    
+    # 1. Quy tắc nội bộ từng nhóm (Extract xong mới được Load)
+    t_master_extract >> t_master_load
+    t_trans_extract >> t_trans_load
+    
+    # 2. Quy tắc toàn cục (Load xong hết mới được chạy dbt)
+    [t_master_load, t_trans_load] >> t_dbt_run-e 
+
+========================================
+FILE: ./configs/config.json
+========================================
+{
+    "CukCuk-Base-URL": "https://graphapi.cukcuk.com/api",
+    "Get-Token-URL": "/Account/Login",
+    "Endpoints": {
+        "order_header": "/v1/orders/paging",
+        "order_detail": "/v1/orders/",
+        "invoice_header": "/v1/sainvoices/paging",
+        "invoice_detail": "/v1/sainvoices/",
+        "product": "/v1/inventoryitems/paging",
+        "customer": "/v1/customers/paging"
+    },
+    "AppID": "CUKCUKOpenPlatform",
+    "SNOWFLAKE": {
+        "ACCOUNT": "xlibfys-fwb58805",
+        "USER": "tuanle",
+        "PASSWORD": "Lethanhtuan97@!",
+        "ROLE": "DE_ROLE",
+        "WAREHOUSE": "RESTAURANT_ETL_WH",
+        "DATABASE": "RESTAURANT_DB",
+        "SCHEMA": "BRONZE"
+    },
+    "Branch-Name_Mapper": {
+        "9489ba59-600f-491e-aa0a-4bd842a4b278": "URAETEI TK",
+        "994c6fe5-da83-441b-a0e8-57a6fed98fb2": "URAETEI HANARE",
+        "031fb45e-b1d4-44c3-9389-a20fd4f36933": "SUSHI HONDA",
+        "4329419d-fbe0-4def-9b26-b17cb2f0f6ee": "URAETEI LITE",
+        "475eb930-f7b4-41ae-a890-da935bb6be53": "SUSHI URAETEI",
+        "2d49aac1-030f-4176-8e45-edb2239826e7": "URAETEI BKK",
+        "33a254df-3bf2-4738-ac43-2af12f90537b": "URAETEI TK II"
+    },
+    "Column-Renaming": {
+        "order_header": { "Id": "order_id", "CustomerId": "customer_id", "Date": "order_date", "TotalAmount": "total_amount", "Status": "order_status" },
+        "order_detail": { "Id": "order_detail_id", "OrderId": "order_id", "ItemId": "item_id", "Quantity": "quantity", "Price": "price", "Amount": "amount" },
+        "invoice_header": { "RefId": "ref_id", "PaymentStatus": "payment_status", "TotalAmount": "total_amount", "RefDate": "ref_date", "RefNo": "ref_no" },
+        "invoice_detail": { "RefDetailId": "ref_detail_id", "RefID": "ref_id", "ItemID": "item_id", "Quantity": "quantity", "Amount": "amount" },
+        "product": { "Id": "product_id", "Name": "product_name", "Price": "price", "Code": "product_code" },
+        "customer": { "Id": "customer_id", "Name": "customer_name", "Tel": "customer_tel", "Address": "address" }
+    }
+}-e 
+
+========================================
+FILE: ./Dockerfile
+========================================
+# Sử dụng Python 3.10 để tương thích tốt nhất
+FROM apache/airflow:2.8.1-python3.10
+
+USER root
+# Cài đặt git và các tools cơ bản
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+         git \
+  && apt-get autoremove -yqq --purge \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+
+# Cài đặt các thư viện từ requirements.txt
+COPY requirements.txt /requirements.txt
+RUN pip install -r /requirements.txt-e 
+

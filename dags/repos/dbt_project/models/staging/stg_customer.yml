@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: stg_customer
+    description: "Bảng danh sách khách hàng đã được khử trùng và ẩn danh thông tin cá nhân."
+    columns:
+      - name: customer_id
+        description: "Mã định danh duy nhất của khách hàng."
+        tests:
+          - unique    # 🚨 Kiểm tra: Không được phép có 2 dòng trùng ID
+          - not_null  # 🚨 Kiểm tra: ID không được phép để trống
+          
+      - name: report_date
+        description: "Ngày ghi nhận khách hàng từ hệ thống."
+        tests:
+          - not_null
+
+      - name: customer_name_hashed
+        description: "Tên khách hàng đã được mã hóa MD5."
+        tests:
+          - not_null

@@ -1,13 +1,13 @@
 name: 'restaurant_analytics'
 version: '1.0.0'
-profile: 'restaurant_athena' # Tên profile trong profiles.yml
+profile: 'restaurant_snowflake'
 model-paths: ["models"]
 
 models:
   restaurant_analytics:
     staging:
       +materialized: view
+      +schema: SILVER
     marts:
       +materialized: table
-      +table_type: iceberg
-      +format: parquet
+      +schema: GOLD

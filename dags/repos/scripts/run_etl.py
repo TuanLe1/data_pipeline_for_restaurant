@@ -88,7 +88,7 @@ def main():
                 
             elif args.step == 'load':
                 logger.info("🚀 Starting MASTER LOAD...")
-                pipeline.load_master_from_disk_to_s3()
+                pipeline.load_master_from_disk_to_snowflake()
 
         # 2. NHÁNH TRANSACTION DATA
         elif args.phase == 'trans':
@@ -104,7 +104,7 @@ def main():
                 
             elif args.step == 'load':
                 logger.info(f"🚀 Starting TRANS LOAD for {args.date}...")
-                pipeline.load_trans_from_disk_to_s3(target_date)
+                pipeline.load_trans_from_disk_to_snowflake(target_date)
 
         logger.info("✅ Job finished successfully.")
 

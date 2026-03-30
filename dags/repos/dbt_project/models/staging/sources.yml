@@ -2,13 +2,49 @@ version: 2
 
 sources:
   - name: cukcuk
-    database: AwsDataCatalog  # Tên database trong Athena/Glue
-    schema: restaurant_db
+    database: RESTAURANT_DB
+    schema: BRONZE
+    description: "Dữ liệu thô (Raw Data) được trích xuất từ CukCuk API qua Python Extractor và nạp trực tiếp vào Snowflake dưới dạng JSON VARIANT."
+    loader: snowflake_python_loader
+    
+    # Định nghĩa các cột dùng chung cho tất cả các bảng ở tầng Bronze
+    # Giúp dbt docs hiển thị cột ngay cả khi đó là bảng raw
     tables:
-      - name: invoice_header
-      - name: invoice_detail
-      - name: customer
-      - name: product
-      - name: invoice_payment
-      - name: order_header
-      - name: order_detail
+      - name: invoice_header_raw
+        identifier: RAW_INVOICE_HEADER_JSON
+        description: "Thông tin tổng quát của hóa đơn (Số tiền, chi nhánh, mã hóa đơn)."
+        columns: &raw_columns
+          - name: RAW_DATA
+            description: "Dữ liệu gốc định dạng JSON chứa toàn bộ thông tin từ API."
+          - name: INGESTED_AT
+            description: "Thời điểm dữ liệu được nạp vào hệ thống (Timestamp)."
+
+      - name: invoice_detail_raw
+        identifier: RAW_INVOICE_DETAIL_JSON
+        description: "Chi tiết các món ăn, số lượng và thành tiền trong từng hóa đơn."
+        columns: *raw_columns
+
+      - name: invoice_payment_raw
+        identifier: RAW_INVOICE_PAYMENT_JSON
+        description: "Thông tin các phương thức thanh toán (Tiền mặt, Thẻ, QR...) của hóa đơn."
+        columns: *raw_columns
+
+      - name: customer_raw
+        identifier: RAW_CUSTOMER_JSON
+        description: "Thông tin khách hàng từ hệ thống (Tên, SĐT, Địa chỉ - Chưa mã hóa)."
+        columns: *raw_columns
+
+      - name: product_raw
+        identifier: RAW_PRODUCT_JSON
+        description: "Danh mục sản phẩm, món ăn và giá niêm yết từ thực đơn."
+        columns: *raw_columns
+
+      - name: order_header_raw
+        identifier: RAW_ORDER_HEADER_JSON
+        description: "Thông tin đơn đặt hàng (Order) trước khi chuyển thành hóa đơn thanh toán."
+        columns: *raw_columns
+
+      - name: order_detail_raw
+        identifier: RAW_ORDER_DETAIL_JSON
+        description: "Chi tiết các món ăn được đặt trong đơn hàng."
+        columns: *raw_columns

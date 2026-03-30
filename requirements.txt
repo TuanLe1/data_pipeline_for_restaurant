@@ -4,7 +4,6 @@ apache-airflow-providers-docker  # <-- Bắt buộc để chạy dbt container
 
 # --- Data Processing ---
 pandas>=2.1.4
-awswrangler>=3.5.0  # <-- "Ông trùm", tự kéo theo numpy, pyarrow, boto3, botocore...
 
 # --- API & Async ---
 aiohttp>=3.9.1
@@ -12,3 +11,7 @@ requests>=2.31.0
 
 # --- Utils ---
 slack_sdk
+
+snowflake-connector-python
+dbt-core==1.7.1
+dbt-snowflake==1.7.1

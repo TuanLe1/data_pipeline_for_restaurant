@@ -1,5 +1,4 @@
--- tests/assert_order_date_not_in_future.sql
--- Ngày đặt hàng không được lớn hơn ngày hiện tại
-select *
-from {{ ref('stg_order_header') }}
-where order_date > current_date
+-- report_date không được lớn hơn ngày hiện tại
+SELECT *
+FROM {{ ref('stg_order_header') }}
+WHERE report_date > CURRENT_DATE()

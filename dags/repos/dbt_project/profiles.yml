@@ -1,10 +1,13 @@
-restaurant_athena:
+restaurant_snowflake:
   target: dev
   outputs:
     dev:
-      type: athena
+      type: snowflake
       threads: 8
-      s3_staging_dir: s3://restaurant-datalake/athena_temp/
-      region_name: ap-southeast-2
-      database: 'AwsDataCatalog'
-      schema: restaurant_db
+      account: xlibfys-fwb58805
+      user: tuanle
+      password: Lethanhtuan97@!
+      role: DE_ROLE
+      database: RESTAURANT_DB
+      warehouse: RESTAURANT_ETL_WH
+      schema: BRONZE

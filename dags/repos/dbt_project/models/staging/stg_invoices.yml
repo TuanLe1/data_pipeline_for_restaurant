@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: stg_invoice_header
+    description: "Thông tin tổng quát của hóa đơn sau khi làm sạch và định dạng lại ngày tháng."
+    columns:
+      - name: ref_id
+        description: "Mã định danh duy nhất của hóa đơn."
+        tests:
+          - unique
+          - not_null
+      - name: branch_name
+        description: "Tên chi nhánh thực hiện giao dịch."
+      - name: payment_status
+        description: "Trạng thái thanh toán (3: Thành công, 4: Hủy/Hoàn)."
+      - name: ref_date_at
+        description: "Thời điểm phát sinh hóa đơn (Timestamp)."
+      - name: report_date
+        description: "Ngày báo cáo hóa đơn."
+
+  - name: stg_invoice_detail
+    description: "Chi tiết các món ăn/dịch vụ trong từng hóa đơn."
+    columns:
+      - name: ref_detail_id
+        description: "ID duy nhất của dòng chi tiết món."
+        tests:
+          - unique
+          - not_null
+      - name: ref_id
+        description: "ID liên kết với bảng Header."
+      - name: item_name
+        description: "Tên món ăn hoặc dịch vụ."
+      - name: amount
+        description: "Thành tiền của món (chưa tính giảm giá/thuế)."
+
+  - name: stg_invoice_payment
+    description: "Thông tin các phương thức thanh toán cho hóa đơn."
+    columns:
+      - name: ref_id
+        description: "ID liên kết với hóa đơn."
+      - name: payment_method
+        description: "Phương thức (Tiền mặt, Thẻ, Chuyển khoản...)."
+      - name: amount
+        description: "Số tiền thanh toán theo phương thức này."

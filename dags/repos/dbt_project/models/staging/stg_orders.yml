@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: stg_order_header
+    description: "Thông tin đơn hàng gốc từ hệ thống đặt món."
+    columns:
+      - name: order_id
+        description: "Mã định danh đơn hàng."
+        tests:
+          - unique
+          - not_null
+      - name: status
+        description: "Trạng thái đơn hàng."
+      - name: total_amount
+        description: "Tổng giá trị đơn hàng."
+
+  - name: stg_order_detail
+    description: "Chi tiết các món trong đơn đặt hàng."
+    columns:
+      - name: order_detail_id
+        description: "ID dòng chi tiết đơn hàng."
+      - name: order_id
+        description: "Mã đơn hàng cha."
+      - name: item_name
+        description: "Tên món ăn."
+      - name: price
+        description: "Đơn giá món ăn tại thời điểm đặt."

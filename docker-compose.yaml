@@ -12,8 +12,6 @@ x-airflow-common:
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
     
     # --- CẤU HÌNH AWS CHUẨN (Chỉ dùng biến môi trường) ---
-    # Đã xóa dòng AWS_SHARED_CREDENTIALS_FILE để tránh lỗi tìm file
-    # Đã xóa dòng AWS_DEFAULT_REGION bị trùng
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
@@ -22,11 +20,7 @@ x-airflow-common:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
-    # Đã sửa lại đúng thư mục config (số nhiều) để khớp với máy local của bạn
-    - ./configs:/opt/airflow/config
-    # ❌ Đã XÓA dòng mount ~/.aws (Không cần thiết nữa & tránh lỗi permission)
-    
-    # Mount Docker Socket (Bắt buộc cho DockerOperator)
+    - ./configs:/opt/airflow/configs
     - /var/run/docker.sock:/var/run/docker.sock
   
   user: "${AIRFLOW_UID}:0"
@@ -55,6 +49,7 @@ services:
     command: webserver
     ports:
       - "8080:8080"
+      - "8001:8001"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
       interval: 10s

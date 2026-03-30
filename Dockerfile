@@ -14,4 +14,4 @@ USER airflow
 
 # Cài đặt các thư viện từ requirements.txt
 COPY requirements.txt /requirements.txt
-RUN pip install --no-cache-dir -r /requirements.txt
+RUN pip install -r /requirements.txt
