@@ -1,49 +1,40 @@
 # 🥗 Serverless Restaurant Data Platform (Modern Data Stack)
 
-![Airflow](https://img.shields.io/badge/Orchestration-Apache%20Airflow-blue?style=flat&logo=apacheairflow) ![dbt](https://img.shields.io/badge/Transformation-dbt%20Core-orange?style=flat&logo=dbt) ![Iceberg](https://img.shields.io/badge/Data%20Lake-Apache%20Iceberg-cyan?style=flat&logo=apache) ![AWS](https://img.shields.io/badge/Cloud-AWS-232F3E?style=flat&logo=amazon-aws) ![Status](https://img.shields.io/badge/Status-Production%20Ready-success)
+![Airflow](https://img.shields.io/badge/Orchestration-Apache%20Airflow-017CEE?style=flat&logo=apacheairflow) ![dbt](https://img.shields.io/badge/Transformation-dbt%20Core-FF694B?style=flat&logo=dbt) ![Snowflake](https://img.shields.io/badge/Data%20Warehouse-Snowflake-29B5E8?style=flat&logo=snowflake) ![AWS](https://img.shields.io/badge/Cloud-AWS-232F3E?style=flat&logo=amazon-aws) ![Status](https://img.shields.io/badge/Status-Production%20Ready-success)
 
 ## 📖 Overview
 
-This project implements a scalable, resilient **Serverless Data Lakehouse** designed to ingest, transform, and analyze restaurant operations data (Sales, Inventory, Customers) from the CukCuk API.
+This repository features a robust, production-grade ELT Pipeline designed to ingest, transform, and analyze restaurant operations data (Sales, Invoices, Customers, Products) from the CukCuk API.
 
-Transitioning from legacy batch scripts, this platform adopts a **Modern Data Stack** architecture using **Apache Airflow** for orchestration, **dbt Core** for modular transformations, and **Apache Iceberg** on AWS S3 for ACID-compliant storage — a cost-effective alternative to traditional data warehouses.
+By leveraging Asynchronous Python for ingestion and dbt Core for modeling within Snowflake, the platform transforms raw JSON objects into high-performance analytical datasets. It follows the Medallion Architecture to ensure data reliability and governance at every stage.
 
 ---
 
 ## 🏗️ Architecture
 
-![System architecture flow](./images/restaurant_architecture.PNG)
+![System architecture flow](./images/data_architecture.png)
 
-### ELT Flow
-1. Orchestration (Apache Airflow)
-    - Manages the end-to-end dependency graph, scheduling, retries, and automated backfills.
-2. Extraction (Python & AsyncIO)
-    - High-throughput ingestion with `asyncio` and a Blind Batching strategy to handle API pagination.
-    - Writes raw data to S3 in Apache Iceberg format (Bronze layer).
-3. Transformation (dbt Core)
-    - Staging: clean raw data, enforce schemas, type casting.
-    - Marts: aggregate business metrics (Revenue, Retention) into analytics-ready tables.
-    - Quality Gates: `dbt test` blocks execution if validations fail.
-4. Serving (AWS Athena)
-    - Serverless SQL queries directly on S3-backed Iceberg tables.
-5. Analytics (Looker Studio)
-    - Visualize KPIs for stakeholders.
+### The pipeline implements a Medallion Architecture entirely hosted within Snowflake:
+1. Extraction (Python AsyncIO): High-concurrency ingestion using aiohttp and asyncio.gather with semaphores to maximize throughput while respecting API rate limits.
+2. Bronze Layer (Raw): Data is loaded into Snowflake as JSON VARIANT objects. This ensures no data loss from the source and allows for schema-on-read flexibility.
+3. Silver Layer (Staging): dbt views flatten the JSON, enforce data types, deduplicate records using ROW_NUMBER(), and anonymize PII (Names, Phone Numbers) via MD5 Hashing.
+4. Gold Layer (Marts): Final tables optimized for BI tools. This layer includes Incremental Models for sales analytics and daily revenue metrics, providing high efficiency and low compute costs.
 
 ---
 
 ## 💡 Key Technical Highlights
 
-### 🚀 Resilient Orchestration & Self-Healing
-- Automated backfills via specialized DAGs (e.g., `maintenance_weekly_backfill`) that detect gaps and re-run partitions.
-- Idempotent jobs ensure consistent results on retries.
+### 🚀 High-Performance Async Ingestion
+- The Python extractor uses asyncio to fetch headers and details in parallel. It handles authentication signatures and token refreshing automatically, ensuring the pipeline can scale to thousands of daily transactions without bottlenecking.
 
-### ⚡ Cost-Effective "Merge-on-Read"
-- Use Iceberg + dbt incremental models for optimized upserts instead of full-partition rewrites.
-- Achieves significant cost savings for CDC and row-level updates.
+### 🛡️ Data Governance & Quality
+- PII Hashing: Custom dbt macros (hash_pii) ensure that sensitive customer data is never stored in plain text in analytical layers.
+- Data Quality Gates: Automated dbt tests (Unique, Not Null, Custom SQL assertions) block bad data from reaching the Gold layer.
+- Slack Observability: Integrated SlackAlert utility sends real-time success/failure notifications with direct links to Airflow logs.
 
-### 🛡️ Data Quality First
-- Schema validation and dbt business tests (e.g., `revenue > 0`, `order_date <= current_date`).
-- Slack alerts for failures and anomalies.
+### 🔄 Resilience & Self-Healing
+- Idempotent Loads: The system uses MERGE strategies and deduplication logic to ensure that re-running the same date doesn't result in duplicate data.
+- Weekly Backfill DAG: A dedicated maintenance pipeline allows for automated historical data re-processing to ensure long-term data integrity.
 
 ---
 
@@ -53,11 +44,10 @@ Transitioning from legacy batch scripts, this platform adopts a **Modern Data St
 | :--- | :--- | :--- |
 | Orchestration | Apache Airflow | Scheduling, DAGs, Backfilling (Docker) |
 | Transformation | dbt Core | SQL transformations, testing, docs |
-| Storage Format | Apache Iceberg | ACID, time-travel, schema evolution |
-| Cloud Storage | AWS S3 | Bronze/Silver/Gold layers |
-| Query Engine | AWS Athena | Serverless SQL |
-| Language | Python 3.10 | Extractors (`asyncio`, `boto3`), Airflow operators |
-| Infra | Docker | Local dev & reproducible environment |
+| Data Warehouse | Snowflake | Hosting Bronze (Raw), Silver (Staging), and Gold (Marts) |
+| Extraction | Python (AsyncIO) | High-speed API ingestion via aiohttp |
+| Secret Management | AWS SSM | Secure storage for API keys and database credentials |
+| Infra | Docker | Containerized Airflow environment for portability |
 
 ---
 
@@ -74,7 +64,7 @@ data_pipeline_for_restaurant/
 │   ├── restaurant_etl_dag.py  # Main production DAG
 │   └── weekly_backfill.py     # Maintenance/backfill DAG
 ├── docker-compose.yaml        # Airflow & local environment
-├── Dockerfile                 # Custom Airflow image (dbt & AWS CLI)
+├── Dockerfile                 # Custom Airflow image with dbt & Snowflake drivers
 └── requirements.txt           # Python deps
 ```
 
@@ -83,8 +73,9 @@ data_pipeline_for_restaurant/
 ## 🚀 Quickstart
 
 ### Prerequisites
-- Docker Desktop (4GB+ RAM recommended)
-- AWS credentials with S3/Athena/Glue permissions
+- Docker & Docker Compose
+- A Snowflake Account
+- AWS Credentials (for SSM Parameter Store access)
 
 ### 1. Setup environment
 Create a `.env` file in the repo root:
@@ -122,22 +113,36 @@ Click the Trigger button (Play icon) to start the DAG manually or wait for the s
 
 **Pipeline Graph View:**
 
-*Visualizing the dependency chain: Async Extraction (Python) → S3 Loading → dbt Transformation (Staging & Marts).*
+*Graph View: Async Extraction → Snowflake Ingestion → dbt Build (Staging & Marts).*
 
 ![Airflow DAG Graph](./images/restaurant_etl_pipeline.PNG)
 
 ---
 
-### 5. Verify Data (AWS Athena)
-Once the pipeline shows a `Success` status, you can query the transformed tables directly in AWS Athena to verify the results (e.g., aggregating Daily Revenue).
+### 5. Verify Data (Snowflake)
+Once successful, log in to your Snowflake Snowsight console to query the analytical layers:
+```sql
+-- Check Daily Revenue in Gold Layer
+SELECT * FROM RESTAURANT_DB.GOLD.REVENUE_DAILY LIMIT 10;
+```
 
-![Athena Query Result](./images/query_result.PNG)
+![Snowflake Query Result](./images/snowflake_verify_data.png)
 
 ## 📊 Monitoring & Outputs
 ### Dashboard (Looker Studio)
 Visualizing Daily Revenue, Order Volume, and Customer Retention.
 
 ![Slack alert](./images/daily_report.PNG)
+
+### dbt Documentation
+Interactive lineage and data dictionary hosted on port 8001:
+Lineage Graph: Visualizes the journey from Raw JSON to Business KPIs.
+
+![Lineage Graph](./images/dbt_lineage_graph.png)
+
+Schema Docs: Column descriptions and test results.
+
+![Document](./images/dbt_document.png)
 
 ### Slack Alerts
 Real-time notifications for pipeline status (Success/Failure).
@@ -147,6 +152,4 @@ Real-time notifications for pipeline status (Success/Failure).
 ## 👨‍💻 Author
 Tuan Le - Data Engineer
 
-Project: Serverless Restaurant Data Platform
-
-Focus: Building scalable, cost-effective data solutions using AWS & Modern Data Stack.
+Focusing on building scalable, cost-effective Data Platforms using the Modern Data Stack.

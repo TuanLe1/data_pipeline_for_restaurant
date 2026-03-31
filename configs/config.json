@@ -11,10 +11,10 @@
     },
     "AppID": "CUKCUKOpenPlatform",
     "SNOWFLAKE": {
-        "ACCOUNT": "xlibfys-fwb58805",
-        "USER": "tuanle",
-        "PASSWORD": "Lethanhtuan97@!",
-        "ROLE": "DE_ROLE",
+        "ACCOUNT": "",
+        "USER": "",
+        "PASSWORD": "",
+        "ROLE": "",
         "WAREHOUSE": "RESTAURANT_ETL_WH",
         "DATABASE": "RESTAURANT_DB",
         "SCHEMA": "BRONZE"

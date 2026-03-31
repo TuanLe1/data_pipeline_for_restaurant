@@ -1149,6 +1149,37 @@ FROM deduplicated
 WHERE row_num = 1-e 
 
 ========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_orders.yml
+========================================
+version: 2
+
+models:
+  - name: stg_order_header
+    description: "Thông tin đơn hàng gốc từ hệ thống đặt món."
+    columns:
+      - name: order_id
+        description: "Mã định danh đơn hàng."
+        tests:
+          - unique
+          - not_null
+      - name: status
+        description: "Trạng thái đơn hàng."
+      - name: total_amount
+        description: "Tổng giá trị đơn hàng."
+
+  - name: stg_order_detail
+    description: "Chi tiết các món trong đơn đặt hàng."
+    columns:
+      - name: order_detail_id
+        description: "ID dòng chi tiết đơn hàng."
+      - name: order_id
+        description: "Mã đơn hàng cha."
+      - name: item_name
+        description: "Tên món ăn."
+      - name: price
+        description: "Đơn giá món ăn tại thời điểm đặt."-e 
+
+========================================
 FILE: ./dags/repos/dbt_project/models/staging/stg_customer.yml
 ========================================
 version: 2
@@ -1229,29 +1260,50 @@ sources:
   - name: cukcuk
     database: RESTAURANT_DB
     schema: BRONZE
-    loader: snowflake_python_loader # Ghi chú để team biết ai đẩy data vào
+    description: "Dữ liệu thô (Raw Data) được trích xuất từ CukCuk API qua Python Extractor và nạp trực tiếp vào Snowflake dưới dạng JSON VARIANT."
+    loader: snowflake_python_loader
     
+    # Định nghĩa các cột dùng chung cho tất cả các bảng ở tầng Bronze
+    # Giúp dbt docs hiển thị cột ngay cả khi đó là bảng raw
     tables:
       - name: invoice_header_raw
         identifier: RAW_INVOICE_HEADER_JSON
-      
+        description: "Thông tin tổng quát của hóa đơn (Số tiền, chi nhánh, mã hóa đơn)."
+        columns: &raw_columns
+          - name: RAW_DATA
+            description: "Dữ liệu gốc định dạng JSON chứa toàn bộ thông tin từ API."
+          - name: INGESTED_AT
+            description: "Thời điểm dữ liệu được nạp vào hệ thống (Timestamp)."
+
       - name: invoice_detail_raw
         identifier: RAW_INVOICE_DETAIL_JSON
-      
+        description: "Chi tiết các món ăn, số lượng và thành tiền trong từng hóa đơn."
+        columns: *raw_columns
+
       - name: invoice_payment_raw
         identifier: RAW_INVOICE_PAYMENT_JSON
-      
+        description: "Thông tin các phương thức thanh toán (Tiền mặt, Thẻ, QR...) của hóa đơn."
+        columns: *raw_columns
+
       - name: customer_raw
         identifier: RAW_CUSTOMER_JSON
-      
+        description: "Thông tin khách hàng từ hệ thống (Tên, SĐT, Địa chỉ - Chưa mã hóa)."
+        columns: *raw_columns
+
       - name: product_raw
         identifier: RAW_PRODUCT_JSON
-      
+        description: "Danh mục sản phẩm, món ăn và giá niêm yết từ thực đơn."
+        columns: *raw_columns
+
       - name: order_header_raw
         identifier: RAW_ORDER_HEADER_JSON
-      
+        description: "Thông tin đơn đặt hàng (Order) trước khi chuyển thành hóa đơn thanh toán."
+        columns: *raw_columns
+
       - name: order_detail_raw
-        identifier: RAW_ORDER_DETAIL_JSON-e 
+        identifier: RAW_ORDER_DETAIL_JSON
+        description: "Chi tiết các món ăn được đặt trong đơn hàng."
+        columns: *raw_columns-e 
 
 ========================================
 FILE: ./dags/repos/dbt_project/models/staging/stg_invoice_detail.sql
@@ -1280,6 +1332,27 @@ SELECT
     INGESTED_AT
 FROM source
 WHERE RAW_DATA:ref_id IS NOT NULL-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_product.yml
+========================================
+version: 2
+
+models:
+  - name: stg_product
+    description: "Danh mục sản phẩm/món ăn từ hệ thống CukCuk."
+    columns:
+      - name: product_id
+        description: "Mã định danh sản phẩm."
+        tests:
+          - unique
+          - not_null
+      - name: product_code
+        description: "Mã SKU hoặc mã vạch của sản phẩm."
+      - name: product_name
+        description: "Tên hiển thị của sản phẩm."
+      - name: price
+        description: "Giá bán niêm yết hiện tại."-e 
 
 ========================================
 FILE: ./dags/repos/dbt_project/models/staging/stg_order_detail.sql
@@ -1352,6 +1425,54 @@ SELECT
     INGESTED_AT
 FROM deduplicated
 WHERE row_num = 1-e 
+
+========================================
+FILE: ./dags/repos/dbt_project/models/staging/stg_invoices.yml
+========================================
+version: 2
+
+models:
+  - name: stg_invoice_header
+    description: "Thông tin tổng quát của hóa đơn sau khi làm sạch và định dạng lại ngày tháng."
+    columns:
+      - name: ref_id
+        description: "Mã định danh duy nhất của hóa đơn."
+        tests:
+          - unique
+          - not_null
+      - name: branch_name
+        description: "Tên chi nhánh thực hiện giao dịch."
+      - name: payment_status
+        description: "Trạng thái thanh toán (3: Thành công, 4: Hủy/Hoàn)."
+      - name: ref_date_at
+        description: "Thời điểm phát sinh hóa đơn (Timestamp)."
+      - name: report_date
+        description: "Ngày báo cáo hóa đơn."
+
+  - name: stg_invoice_detail
+    description: "Chi tiết các món ăn/dịch vụ trong từng hóa đơn."
+    columns:
+      - name: ref_detail_id
+        description: "ID duy nhất của dòng chi tiết món."
+        tests:
+          - unique
+          - not_null
+      - name: ref_id
+        description: "ID liên kết với bảng Header."
+      - name: item_name
+        description: "Tên món ăn hoặc dịch vụ."
+      - name: amount
+        description: "Thành tiền của món (chưa tính giảm giá/thuế)."
+
+  - name: stg_invoice_payment
+    description: "Thông tin các phương thức thanh toán cho hóa đơn."
+    columns:
+      - name: ref_id
+        description: "ID liên kết với hóa đơn."
+      - name: payment_method
+        description: "Phương thức (Tiền mặt, Thẻ, Chuyển khoản...)."
+      - name: amount
+        description: "Số tiền thanh toán theo phương thức này."-e 
 
 ========================================
 FILE: ./dags/repos/dbt_project/macros/hash_pii.sql
@@ -1773,10 +1894,10 @@ FILE: ./configs/config.json
     },
     "AppID": "CUKCUKOpenPlatform",
     "SNOWFLAKE": {
-        "ACCOUNT": "xlibfys-fwb58805",
-        "USER": "tuanle",
-        "PASSWORD": "Lethanhtuan97@!",
-        "ROLE": "DE_ROLE",
+        "ACCOUNT": "",
+        "USER": "",
+        "PASSWORD": "",
+        "ROLE": "",
         "WAREHOUSE": "RESTAURANT_ETL_WH",
         "DATABASE": "RESTAURANT_DB",
         "SCHEMA": "BRONZE"
