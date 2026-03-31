@@ -1,4 +1,4 @@
-# 🥗 Serverless Restaurant Data Platform (Modern Data Stack)
+# 🥗 Modern Data Stack with Snowflake as the data warehouse and Airflow-based orchestration
 
 ![Airflow](https://img.shields.io/badge/Orchestration-Apache%20Airflow-017CEE?style=flat&logo=apacheairflow) ![dbt](https://img.shields.io/badge/Transformation-dbt%20Core-FF694B?style=flat&logo=dbt) ![Snowflake](https://img.shields.io/badge/Data%20Warehouse-Snowflake-29B5E8?style=flat&logo=snowflake) ![AWS](https://img.shields.io/badge/Cloud-AWS-232F3E?style=flat&logo=amazon-aws) ![Status](https://img.shields.io/badge/Status-Production%20Ready-success)
 
