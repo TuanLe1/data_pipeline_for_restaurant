@@ -3,34 +3,26 @@ import sys
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-from airflow.providers.docker.operators.docker import DockerOperator
-from docker.types import Mount
+from airflow.models.param import Param # Import để tạo UI chọn ngày
 
+# 1. SETUP ĐƯỜNG DẪN
+AIRFLOW_INTERNAL_PATH = "/opt/airflow/dags/repos"
+ETL_SCRIPT_PATH = f"{AIRFLOW_INTERNAL_PATH}/scripts/run_etl.py"
+DBT_PROJECT_PATH = f"{AIRFLOW_INTERNAL_PATH}/dbt_project"
 
-# 👇 1. THÊM ĐOẠN NÀY ĐỂ AIRFLOW TÌM THẤY FOLDER 'repos'
 dag_folder = os.path.dirname(__file__)
 repos_path = os.path.join(dag_folder, 'repos')
 if repos_path not in sys.path:
     sys.path.append(repos_path)
 
-# 👇 2. GIỜ MỚI IMPORT ĐƯỢC
 try:
     from src.utils.slack_alert import task_fail_slack_alert
 except ImportError:
-    # Fallback phòng hờ
-    from repos.src.utils.slack_alert import task_fail_slack_alert
-
-# --- CẤU HÌNH ĐƯỜNG DẪN ---
-AIRFLOW_INTERNAL_PATH = "/opt/airflow/dags/repos"
-HOST_DBT_PATH = "/home/tuanle/DE-lab/data_pipeline_for_restaurant/dags/repos/dbt_project"
-HOST_AWS_PATH = "/home/tuanle/.aws"
-
-# Đường dẫn đến file script điều phối mới (bạn nhớ tạo file này như bước trước nhé)
-ETL_SCRIPT_PATH = f"{AIRFLOW_INTERNAL_PATH}/scripts/run_etl.py"
+    task_fail_slack_alert = None
 
 default_args = {
     'owner': 'tuanle',
-    'retries': 2, # Tăng lên 2 để nếu mạng lag thì tự thử lại
+    'retries': 2,
     'retry_delay': timedelta(minutes=5),
     'on_failure_callback': task_fail_slack_alert
 }
@@ -38,79 +30,55 @@ default_args = {
 with DAG(
     'restaurant_elt_pipeline',
     default_args=default_args,
-    description='Full ELT: Split Architecture (Extract -> Disk -> S3 -> dbt)',
-    schedule_interval='0 8 * * *',
+    description='Full Sync Master & Transactions with Manual Date Selection',
+    schedule_interval='0 1 * * *', 
     start_date=datetime(2024, 1, 20),
-    params={"manual_trigger": "yes"},
-    max_active_runs=1,
-    # max_active_tasks=1, # 👈 COMMENT DÒNG NÀY ĐỂ EXTRACT SONG SONG
     catchup=False,
-    tags=['production', 'optimized'],
+    max_active_runs=1,
+    tags=['production', 'parameterized'],
+    # Thêm cấu hình tham số ở đây
+    params={
+        "target_date": Param(
+            default=None, 
+            type=["string", "null"], 
+            format="date",
+            description="Chọn ngày chạy (YYYY-MM-DD). Để trống để lấy ngày chạy tự động (ds)."
+        )
+    },
 ) as dag:
 
-    # =================================================================
-    # GROUP 1: MASTER DATA (Product, Customer)
-    # =================================================================
-    
-    # 1.1. Extract (API -> Disk)
+    # Logic Jinja: Ưu tiên lấy ngày từ params, nếu không có thì lấy {{ ds }} (ngày của lịch chạy)
+    # Chúng ta dùng một biến trung gian để câu lệnh bash sạch sẽ hơn
+    TARGET_DATE = "{{ params.target_date if params.target_date else ds }}"
+
+    # --- NHÁNH 1: MASTER DATA ---
     t_master_extract = BashOperator(
-        task_id='master_extract',
+        task_id='master_extract_to_s3',
         bash_command=f'python3 {ETL_SCRIPT_PATH} --phase master --step extract'
     )
 
-    # 1.2. Load (Disk -> S3)
     t_master_load = BashOperator(
-        task_id='master_load',
+        task_id='master_load_to_clickhouse',
         bash_command=f'python3 {ETL_SCRIPT_PATH} --phase master --step load'
     )
 
-    # =================================================================
-    # GROUP 2: TRANSACTION DATA (Orders, Invoices)
-    # =================================================================
-
-    # 2.1. Extract (API -> Disk)
-    # {{ ds }} sẽ được Airflow thay thế bằng ngày chạy (YYYY-MM-DD)
-    t_trans_extract = BashOperator(
-        task_id='trans_extract',
-        bash_command=f'python3 {ETL_SCRIPT_PATH} --phase trans --step extract --date ' + '{{ ds }}'
+    # --- NHÁNH 2: TRANSACTION DATA ---
+    t_trans_sync = BashOperator(
+        task_id='transactions_sync_to_s3',
+        # Sử dụng biến TARGET_DATE đã khai báo ở trên
+        bash_command=f'python3 {ETL_SCRIPT_PATH} --phase trans --step extract --date {TARGET_DATE}'
     )
 
-    # 2.2. Load (Disk -> S3)
-    t_trans_load = BashOperator(
-        task_id='trans_load',
-        bash_command=f'python3 {ETL_SCRIPT_PATH} --phase trans --step load --date ' + '{{ ds }}'
+    # --- CUỐI CÙNG: DBT TRANSFORM ---
+    t_dbt_run = BashOperator(
+        task_id='dbt_transform_and_test',
+        bash_command=(
+            f'cd {DBT_PROJECT_PATH} && '
+            f'dbt run --profiles-dir . && '   # bỏ --full-refresh ở đây
+            f'dbt test --profiles-dir .'      # chạy tất cả tests sau mỗi run
+        )
     )
 
-    # =================================================================
-    # GROUP 3: TRANSFORM (dbt)
-    # =================================================================
-    
-    t_dbt_run = DockerOperator(
-        task_id='dbt_run',
-        image='custom-dbt-athena:1.7.1',
-        force_pull=False,
-        api_version='auto',
-        auto_remove=True,
-        command="dbt build --profiles-dir /dbt --project-dir /dbt",
-        mount_tmp_dir=False,
-        docker_url="unix://var/run/docker.sock",
-        network_mode="bridge",
-        mounts=[
-            Mount(source=HOST_DBT_PATH, target="/dbt", type="bind"),
-            Mount(source=HOST_AWS_PATH, target="/root/.aws", type="bind"),
-        ],
-        environment={
-            'AWS_REGION': 'ap-southeast-2'
-        }
-    )
-
-    # =================================================================
-    # 🔗 THIẾT LẬP DEPENDENCIES (LUỒNG CHẠY)
-    # =================================================================
-    
-    # 1. Quy tắc nội bộ từng nhóm (Extract xong mới được Load)
+    # THIẾT LẬP LUỒNG CHẠY
     t_master_extract >> t_master_load
-    t_trans_extract >> t_trans_load
-    
-    # 2. Quy tắc toàn cục (Load xong hết mới được chạy dbt)
-    [t_master_load, t_trans_load] >> t_dbt_run
+    [t_master_load, t_trans_sync] >> t_dbt_run

@@ -1,8 +1,11 @@
 version: '3.8'
 
+# --- 1. CONFIG CHUNG CHO AIRFLOW (DRY Principle) ---
 x-airflow-common:
   &airflow-common
   build: .
+  user: "${AIRFLOW_UID}:0"
+  env_file: .env # Khuyên dùng để quản lý AWS Key/Secret
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -10,65 +13,63 @@ x-airflow-common:
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
-    
-    # --- CẤU HÌNH AWS CHUẨN (Chỉ dùng biến môi trường) ---
-    # Đã xóa dòng AWS_SHARED_CREDENTIALS_FILE để tránh lỗi tìm file
-    # Đã xóa dòng AWS_DEFAULT_REGION bị trùng
+    # AWS Creds cho các script Python
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
-
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
-    # Đã sửa lại đúng thư mục config (số nhiều) để khớp với máy local của bạn
     - ./configs:/opt/airflow/config
-    # ❌ Đã XÓA dòng mount ~/.aws (Không cần thiết nữa & tránh lỗi permission)
-    
-    # Mount Docker Socket (Bắt buộc cho DockerOperator)
+    - ./temp_data:/opt/airflow/temp_data # Folder trung gian cho Python scripts
     - /var/run/docker.sock:/var/run/docker.sock
-  
-  user: "${AIRFLOW_UID}:0"
-  depends_on:
-    &airflow-common-depends-on
-    postgres:
-      condition: service_healthy
+  networks:
+    - restaurant_net # Quan trọng để thấy ClickHouse/MinIO
 
 services:
+  # --- 2. CƠ SỞ DỮ LIỆU AIRFLOW (POSTGRES) ---
   postgres:
     image: postgres:13
+    container_name: airflow-postgres
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
+    networks:
+      - restaurant_net
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
       retries: 5
     restart: always
 
+  # --- 3. CÁC THÀNH PHẦN AIRFLOW ---
   airflow-webserver:
     <<: *airflow-common
+    container_name: airflow-webserver
     command: webserver
     ports:
       - "8080:8080"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: always
 
   airflow-scheduler:
     <<: *airflow-common
+    container_name: airflow-scheduler
     command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: always
 
   airflow-init:
     <<: *airflow-common
+    container_name: airflow-init
     command: version
     environment:
       <<: *airflow-common-env
@@ -76,6 +77,175 @@ services:
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+
+  # --- 4. LANDING ZONE (MINIO) ---
+  minio:
+    image: minio/minio
+    container_name: minio-lab
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    volumes:
+      - ./minio_data:/data
+    networks:
+      - restaurant_net
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 20s
+      retries: 5
+
+  # --- 5. ANALYTICS ENGINE (CLICKHOUSE) ---
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    container_name: clickhouse-lab
+    ports:
+      - "8123:8123"
+      - "9002:9000"
+    volumes:
+      - ./ch_data:/var/lib/clickhouse/
+      - ./ch_logs:/var/log/clickhouse-server/
+    environment:
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: password
+    networks:
+      - restaurant_net
+    depends_on:
+      minio:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- 6. TRANSFORM TOOL (DBT) ---
+  dbt:
+    image: ghcr.io/dbt-adpa/dbt-clickhouse:latest
+    container_name: dbt-lab
+    volumes:
+      - ./dbt_project:/usr/app
+      - ./dbt_project/profiles.yml:/root/.dbt/profiles.yml
+    environment:
+      DBT_PROFILES_DIR: /root/.dbt/
+    networks:
+      - restaurant_net
+    profiles: ["dbt_only"]
+    depends_on:
+      - clickhouse
+  
+  # 1. Thêm Redis làm Message Broker (Thay thế SQS)
+  
+  # --- INIT CONTAINER (Chạy 1 lần rồi thoát) ---
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile_worker # Dùng chung Image với consumer
+    container_name: db-init-process
+    networks:
+      - restaurant_net
+    volumes:
+      - ./configs:/opt/airflow/config
+      - ./dags/repos/dbt_project:/app/dbt_project
+    # Lệnh: Tạo bảng raw -> Chạy dbt -> Thoát
+    command: >
+      bash -c "sleep 30 && 
+               python3 scripts/init_db.py && 
+               cd dbt_project && 
+               dbt run --profiles-dir ."
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+  minio-init:
+    image: minio/mc
+    networks:
+      - restaurant_net
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c "
+      echo '⏳ Đợi MinIO server (minio-lab) sẵn sàng...'
+      
+      # Thử kết nối và liệt kê bucket cho đến khi thành công
+      # (mc alias set không kiểm tra kết nối ngay, nên ta bồi thêm lệnh 'ls')
+      until /usr/bin/mc alias set myminio http://minio-lab:9000 admin password && /usr/bin/mc ls myminio > /dev/null 2>&1; do
+        echo '...MinIO chưa tỉnh hoặc chưa nhận kết nối, đợi 2s...'
+        sleep 2
+      done
+
+      set -e
+      echo '🚀 Bắt đầu cấu hình...'
+      /usr/bin/mc mb --ignore-existing myminio/restaurant-datalake
+      /usr/bin/mc anonymous set download myminio/restaurant-datalake
+      
+      echo '✅ Cấu hình MinIO THỰC SỰ hoàn tất!'
+      "
+  redis-queue:
+    image: redis:alpine
+    container_name: redis-queue
+    networks:
+      - restaurant_net
+
+  # 2. Producer Worker: Chạy script lấy data mỗi 10 phút
+  ingestion-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile_worker
+    container_name: ingestion-producer
+    command: python3 scripts/producer_worker.py
+    environment:
+      - PYTHONPATH=/app
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - ./configs:/opt/airflow/config
+    networks:
+      - restaurant_net
+    depends_on:
+      redis-queue:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+
+  # 3. Consumer Worker: Chạy script nạp data vào ClickHouse
+  ingestion-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile_worker
+    container_name: ingestion-consumer
+    command: python3 scripts/consumer_worker.py
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./configs:/opt/airflow/config
+      - ./dags/repos/dbt_project:/app/dbt_project
+    networks:
+      - restaurant_net
+    depends_on:
+      redis-queue:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+
+# --- CẤU HÌNH HỆ THỐNG ---
+networks:
+  restaurant_net:
+    driver: bridge
 
 volumes:
   postgres-db-volume:

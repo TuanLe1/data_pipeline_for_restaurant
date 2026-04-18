@@ -11,6 +11,11 @@ venv/
 .venv/
 myenv/
 .env
+ch_data/
+ch_logs/
+all_code.txt
+dbt_docs/
+minio_data/
 
 # ==================================
 # 2. Airflow & Logs

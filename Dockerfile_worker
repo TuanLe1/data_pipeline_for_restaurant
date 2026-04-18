@@ -1,0 +1,33 @@
+# File: ./Dockerfile.worker
+FROM python:3.10-slim
+
+# 1. Thiết lập môi trường
+WORKDIR /app
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# 2. Cài đặt system dependencies tối thiểu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Cài đặt thư viện Python
+# Tận dụng requirements.txt hiện có của bạn
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 4. Copy mã nguồn (Chỉ copy những gì cần thiết)
+# Lưu ý đường dẫn tương ứng với cấu trúc folder của bạn
+COPY ./dags/repos/src ./src
+COPY ./dags/repos/scripts ./scripts
+COPY ./configs ./configs
+COPY ./dags/repos/dbt_project ./dbt_project
+RUN mkdir -p /app/dbt_project/logs /app/dbt_project/target \
+    && chmod -R 777 /app/dbt_project/logs /app/dbt_project/target
+
+# 5. User bảo mật (không dùng root)
+RUN useradd -m workeruser
+USER workeruser
+
+# CMD mặc định là chạy python
+CMD ["python3"]

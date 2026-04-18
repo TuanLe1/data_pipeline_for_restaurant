@@ -12,3 +12,10 @@ requests>=2.31.0
 
 # --- Utils ---
 slack_sdk
+
+clickhouse-connect==0.7.0
+pytz
+python-dateutil
+
+dbt-clickhouse==1.7.1
+redis==5.0.1

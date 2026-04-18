@@ -1,8 +1,7 @@
 {{ config(
     materialized='table',
-    table_type='iceberg',
-    format='parquet',
-    partitioned_by=['year', 'month']
+    engine='MergeTree()',
+    order_by=['report_date', 'branch_name']
 ) }}
 
 WITH raw_data AS (

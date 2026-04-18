@@ -13,6 +13,10 @@ models:
         description: "Mã định danh món ăn trong đơn hàng."
         tests:
           - not_null
+      
+      - name: ref_detail_id
+        tests:
+          - not_null
 
       - name: report_date
         description: "Ngày báo cáo doanh thu. Dùng cột này để Partition và Filter."
@@ -23,6 +27,10 @@ models:
         description: "Doanh thu tổng sau thuế (Gross Revenue). Công thức = Amount - Giảm giá + Thuế."
         tests:
           - not_null
-
+          
       - name: customer_id
         description: "ID khách hàng. (Lưu ý: Tên và SĐT đã bị ẩn danh hóa ở tầng Staging)."
+
+    tests:
+      - unique:
+          column_name: "concat(order_id, item_id, ref_detail_id)"

@@ -1,10 +1,12 @@
-restaurant_athena:
+restaurant_analytics: # Khớp với dbt_project.yml
   target: dev
   outputs:
     dev:
-      type: athena
-      threads: 8
-      s3_staging_dir: s3://restaurant-datalake/athena_temp/
-      region_name: ap-southeast-2
-      database: 'AwsDataCatalog'
+      type: clickhouse
+      host: clickhouse-lab
+      port: 8123
+      user: admin
+      password: password
       schema: restaurant_db
+      secure: False
+      verify: False

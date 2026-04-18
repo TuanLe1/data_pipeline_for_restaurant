@@ -1,17 +1,7 @@
-{{ config(materialized='view') }}
+{{ config(
+    materialized='view'
+) }}
 
-WITH source AS (
-    SELECT * FROM {{ source('cukcuk', 'order_header') }}
-),
-
-deduplicated AS (
-    SELECT *,
-        ROW_NUMBER() OVER (
-            PARTITION BY order_id
-            ORDER BY order_date DESC
-        ) as row_num
-    FROM source
-)
-
-SELECT * FROM deduplicated 
-WHERE row_num = 1
+-- ClickHouse không cần ROW_NUMBER() phức tạp ở tầng staging 
+-- vì ReplacingMergeTree sẽ tự xử lý ở tầng table.
+SELECT * FROM {{ source('cukcuk', 'order_header') }}

@@ -50,7 +50,6 @@ with DAG(
             
             # Extract & Load Transaction
             python3 {ETL_SCRIPT_PATH} --phase trans --step extract --date $TARGET_DATE
-            python3 {ETL_SCRIPT_PATH} --phase trans --step load --date $TARGET_DATE
             
             echo "✅ Done $TARGET_DATE"
         done
@@ -58,24 +57,9 @@ with DAG(
     )
 
     # 2. Chạy dbt với tham số dynamic
-    t_dbt_run = DockerOperator(
-        task_id='dbt_incremental_heal', # Đổi tên cho đúng bản chất
-        image='custom-dbt-athena:1.7.1',
-        force_pull=False,
-        api_version='auto',
-        auto_remove=True,
-        # 👇 QUAN TRỌNG: Truyền biến backfill_days vào đây
-        command="dbt build --profiles-dir /dbt --project-dir /dbt --vars '{\"backfill_days\": {{ params.lookback_days }} }'", 
-        mount_tmp_dir=False,
-        docker_url="unix://var/run/docker.sock",
-        network_mode="host", # 👇 Nên dùng host để ổn định mạng
-        mounts=[
-            Mount(source=HOST_DBT_PATH, target="/dbt", type="bind"),
-            Mount(source=HOST_AWS_PATH, target="/root/.aws", type="bind"),
-        ],
-        environment={
-            'AWS_REGION': 'ap-southeast-2'
-        }
+    t_dbt_run = BashOperator(
+        task_id='dbt_incremental_heal',
+        bash_command='cd /opt/airflow/dags/repos/dbt_project && dbt run --select master_sales_analytics revenue_daily --profiles-dir . --target dev && dbt test --profiles-dir . --target dev'
     )
 
     t_backfill_loop >> t_dbt_run

@@ -1,65 +1,56 @@
 {{ config(
     materialized='incremental',
-    table_type='iceberg',
-    format='parquet',
-    partitioned_by=['year', 'month'],
-    alias='view_master_sales_analytics',
-    incremental_strategy='merge', 
-    unique_key=['order_id', 'item_id']
+    engine='ReplacingMergeTree(ref_date)',
+    order_by=['report_date', 'order_id', 'item_id', 'ref_detail_id'],
+    unique_key=['report_date', 'order_id', 'item_id', 'ref_detail_id']
 ) }}
+
+/*
+  THAY ĐỔI so với version cũ:
+  1. materialized_view  →  incremental
+     Lý do: MV với INNER JOIN có race condition — nếu header và detail
+     không nằm trong cùng batch INSERT, JOIN miss và order mất khỏi mart.
+     incremental để dbt kiểm soát JOIN sau khi cả hai đã có đủ trong Silver.
+
+  2. Thêm unique_key để dbt upsert đúng khi backfill chạy lại.
+
+  3. Thêm incremental filter lookback 2 ngày trên cả header lẫn detail.
+     - is_incremental() = false (lần đầu): load toàn bộ history.
+     - is_incremental() = true  (các lần sau): chỉ reprocess 2 ngày gần nhất.
+*/
 
 WITH header AS (
     SELECT * FROM {{ ref('stg_invoice_header') }}
     {% if is_incremental() %}
-        WHERE ref_date >= date_add('day', -{{ var('backfill_days', 3) }}, current_date)
+    WHERE toDate(ref_date) >= toDate(now()) - 2
     {% endif %}
 ),
 
 detail AS (
     SELECT * FROM {{ ref('stg_invoice_detail') }}
+    {% if is_incremental() %}
+    WHERE toDate(ref_date) >= toDate(now()) - 2
+    {% endif %}
 ),
 
 final AS (
     SELECT
-        h.branch_name,
-        h.ref_id AS order_id,
-        h.ref_no AS invoice_code,
+        h.branch_name                                AS branch_name,
+        h.ref_id                                     AS order_id,
+        h.ref_no                                     AS invoice_code,
         h.customer_id,
+        d.ref_detail_id,
         d.item_name,
         d.item_id,
-        
-        h.ref_date,
-        CAST(h.ref_date AS DATE) AS report_date,
-        date_format(h.ref_date, '%H') AS report_hour,
-        h.day, 
-        h.month, 
-        h.year,
+        assumeNotNull(toDateTime(h.ref_date))        AS ref_date,
+        toDate(h.ref_date)                           AS report_date,
+        formatDateTime(toDateTime(h.ref_date), '%H') AS report_hour,
         d.quantity,
-        
-        -- [A] Doanh thu thuần
-        (d.amount 
-         - COALESCE(d.allocation_amount, 0) 
-         - COALESCE(d.allocation_delivery_promotion_amount, 0)
-        ) AS net_revenue_pre_tax,
-
-        -- [B] Thuế VAT
-        COALESCE(d.tax_amount, 0) AS tax_amount,
-
-        -- [C] Doanh thu tổng
-        (d.amount 
-         - COALESCE(d.allocation_amount, 0) 
-         - COALESCE(d.allocation_delivery_promotion_amount, 0)
-         + COALESCE(d.tax_amount, 0)
-        ) AS net_revenue_inclusive
-
+        (d.amount - coalesce(d.allocation_amount, 0)) AS net_revenue_pre_tax,
+        coalesce(d.tax_amount, 0)                    AS tax_amount,
+        (d.amount + coalesce(d.tax_amount, 0))       AS net_revenue_inclusive
     FROM detail d
-    JOIN header h 
-        ON d.ref_id = h.ref_id
-    WHERE h.payment_status <> 4
+    INNER JOIN header h ON d.ref_id = h.ref_id
 )
 
 SELECT * FROM final
-
-{% if is_incremental() %}
-    WHERE report_date >= (SELECT max(report_date) FROM {{ this }})
-{% endif %}

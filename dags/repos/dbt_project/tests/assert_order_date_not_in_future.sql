@@ -2,4 +2,4 @@
 -- Ngày đặt hàng không được lớn hơn ngày hiện tại
 select *
 from {{ ref('stg_order_header') }}
-where order_date > current_date
+where order_date > today()

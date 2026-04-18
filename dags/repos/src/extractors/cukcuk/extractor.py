@@ -126,102 +126,7 @@ class CukCukExtractor:
         except:
             return datetime.min.replace(tzinfo=timezone.utc)
 
-    # =========================================================================
-    # 1. EXTRACT ORDERS
-    # =========================================================================
-    async def extract_orders(self, from_date: str, to_date: datetime = None) -> List[Dict]:
-        all_orders = []
-        limit = 100
-        endpoint = self.config.get("Get-OrderHeader-URL", "/v1/orders/paging")
-        url = f"{self.base_url}{endpoint}"
-        detail_endpoint = self.config.get("Get-OrderDetail-URL", "/v1/orders/")
-        
-        cutoff_date = self._parse_date_safe(to_date) if to_date else None
-        logger.info(f"[ASYNC] Start extracting ORDERS from: {from_date} (Batch Strategy)")
-
-        connector = TCPConnector(limit=0, ttl_dns_cache=300)
-        # Tăng timeout tổng lên 900s (15 phút) cho an toàn
-        timeout = ClientTimeout(total=900) 
-
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            current_page = 1
-            is_finished = False
-            BATCH_SIZE = 5
-            
-            while not is_finished:
-                header_tasks = []
-                for i in range(BATCH_SIZE):
-                    payload = {
-                        "Page": current_page + i, "Limit": limit, 
-                        "BranchId": self.branch_id, "LastSyncDate": from_date
-                    }
-                    header_tasks.append(self._call_api_async(session, url, method="POST", json_body=payload))
-                
-                # Nếu API lỗi, hàm _call_api_async sẽ RAISE exception, 
-                # asyncio.gather sẽ ném lỗi đó ra ngoài => Script dừng => Airflow Failed
-                header_results = await asyncio.gather(*header_tasks)
-                
-                valid_orders_in_batch = []
-                batch_has_empty_page = False
-                items_count_in_batch = 0
-                
-                for res in header_results:
-                    # Không cần check "if not res" nữa vì res luôn có dữ liệu hoặc đã crash
-                    data_page = res.get("Data", [])
-                    
-                    if not data_page:
-                        batch_has_empty_page = True
-                        continue
-                        
-                    items_count_in_batch += len(data_page)
-                    if len(data_page) < limit: 
-                        is_finished = True 
-                    
-                    # Client-side Date Filter
-                    for item in data_page:
-                        if cutoff_date:
-                            item_dt = self._parse_date_safe(item.get("Date"))
-                            if item_dt < cutoff_date:
-                                valid_orders_in_batch.append(item)
-                        else:
-                            valid_orders_in_batch.append(item)
-                            
-                # Fetch Details for valid orders
-                if valid_orders_in_batch:
-                    detail_tasks = []
-                    for order in valid_orders_in_batch:
-                        oid = order.get("Id")
-                        detail_url = f"{self.base_url}{detail_endpoint}{oid}"
-                        detail_tasks.append(self._call_api_async(session, detail_url))
-                    
-                    details_results = await asyncio.gather(*detail_tasks)
-
-                    # Merge logic
-                    for order, raw_detail_resp in zip(valid_orders_in_batch, details_results):
-                        # raw_detail_resp chắc chắn có data vì nếu lỗi đã raise rồi
-                        content = raw_detail_resp.get("Data", [])
-                        if isinstance(content, dict):
-                            line_items = content.get("OrderDetails", [])
-                        else:
-                            line_items = content if isinstance(content, list) else []
-                        
-                        parent_info = {
-                            "OrderId": order.get("Id"), "OrderDate": order.get("Date"),
-                            "BranchId": order.get("BranchId"), "BranchName": order.get("BranchName")
-                        }
-                        for item in line_items: item.update(parent_info)
-                        order["line_items"] = line_items
-                        all_orders.append(order)
-                
-                # Check stop condition
-                if batch_has_empty_page or items_count_in_batch == 0:
-                    is_finished = True
-                
-                if not is_finished:
-                    current_page += BATCH_SIZE
-        
-        return all_orders
-
+    
     # =========================================================================
     # 2. EXTRACT INVOICES
     # =========================================================================
@@ -307,8 +212,9 @@ class CukCukExtractor:
         url = f"{self.base_url}{endpoint}"
         
         base_payload = {
-            "Limit": limit, "IncludeInactive": True,
-            "BranchId": "00000000-0000-0000-0000-000000000000", "LastSyncDate": "2010-01-01T00:00:00Z"
+            "Limit": 100, 
+            "IncludeInactive": True,
+            "BranchId": "00000000-0000-0000-0000-000000000000"
         }
         
         logger.info(f"📚 [ASYNC] Extracting {name} (Direct Batching)...")
@@ -355,7 +261,96 @@ class CukCukExtractor:
         return all_items
 
     async def extract_products(self) -> List[Dict]:
-        return await self._extract_master_data("Get-Product-URL", "/v1/inventoryitems/paging", "PRODUCTS")
+        return await self._extract_master_data(
+            "Get-Product-URL", 
+            "/v1/inventoryitems/paging", 
+            "PRODUCTS"
+        )
 
     async def extract_customers(self) -> List[Dict]:
-        return await self._extract_master_data("Get-Customer-URL", "/v1/customers/paging", "CUSTOMERS")
+        return await self._extract_master_data(
+            "Get-Customer-URL", 
+            "/v1/customers/paging", 
+            "CUSTOMERS"
+        )
+
+    async def extract_orders_stream(self, from_date: str, branch_id: str):
+        """Generator: Fetch tới đâu yield tới đó để tiết kiệm RAM"""
+        current_page = 1
+        limit = 100
+        is_finished = False
+        endpoint = self.config.get("Get-OrderHeader-URL", "/v1/orders/paging")
+        url = f"{self.base_url}{endpoint}"
+        
+        async with aiohttp.ClientSession() as session:
+            while not is_finished:
+                payload = {"Page": current_page, "Limit": limit, "BranchId": branch_id, "LastSyncDate": from_date}
+                res = await self._call_api_async(session, url, method="POST", json_body=payload)
+                data_page = res.get("Data", [])
+                
+                if not data_page: break
+                
+                # Fetch details cho 100 đơn của batch này
+                # (Tuan nên tận dụng hàm fetch_details có sẵn của bạn)
+                batch_data = await self._fetch_details_batch(session, data_page) 
+                
+                # 👇 TRẢ DỮ LIỆU VỀ RAM VÀ TIẾP TỤC VÒNG LẶP
+                yield batch_data
+                
+                if len(data_page) < limit: is_finished = True
+                current_page += 1
+
+    async def _fetch_details_batch(self, session, header_data):
+        # Tuan copy logic fetch details hiện có của bạn vào đây 
+        # để gộp header và line_items thành 1 cục trước khi yield
+        detail_endpoint = self.config.get("Get-OrderDetail-URL", "/v1/orders/")
+        tasks = [self._call_api_async(session, f"{self.base_url}{detail_endpoint}{o['Id']}") for o in header_data]
+        details = await asyncio.gather(*tasks)
+        
+        for order, det in zip(header_data, details):
+            content = det.get("Data", {})
+            order["line_items"] = content.get("OrderDetails", []) if isinstance(content, dict) else []
+        return header_data
+    
+    async def extract_invoices_stream(self, from_date: str, branch_id: str):
+        """Generator: Fetch Invoice tới đâu yield tới đó"""
+        current_page = 1
+        limit = 100
+        is_finished = False
+        endpoint = self.config.get("Get-SAInvoiceHeader-URL", "/v1/sainvoices/paging")
+        url = f"{self.base_url}{endpoint}"
+        
+        async with aiohttp.ClientSession() as session:
+            while not is_finished:
+                # Payload dùng cho Invoice (CukCuk yêu cầu LastSyncDate)
+                payload = {"Page": current_page, "Limit": limit, "BranchId": branch_id, "LastSyncDate": from_date}
+                res = await self._call_api_async(session, url, method="POST", json_body=payload)
+                
+                data_page = res.get("Data", [])
+                if not data_page: break
+                
+                # Fetch chi tiết cho từng hóa đơn (để lấy món ăn & thanh toán)
+                batch_data = await self._fetch_invoice_details_batch(session, data_page) 
+                
+                yield batch_data
+                
+                if len(data_page) < limit: is_finished = True
+                current_page += 1
+
+    async def _fetch_invoice_details_batch(self, session, header_data):
+        """Helper để lấy chi tiết hóa đơn cho một batch"""
+        detail_endpoint = self.config.get("Get-SAInvoiceDetail-URL", "/v1/sainvoices/")
+        # Tạo danh sách các task gọi API detail song song
+        tasks = [self._call_api_async(session, f"{self.base_url}{detail_endpoint}{o['RefId']}") for o in header_data]
+        details = await asyncio.gather(*tasks)
+        
+        for invoice, det in zip(header_data, details):
+            content = det.get("Data", {})
+            # Gộp chi tiết vào header để nạp 1 lần
+            if isinstance(content, dict):
+                invoice["line_items"] = content.get("SAInvoiceDetails", [])
+                invoice["payments"] = content.get("SAInvoicePayments", [])
+            else:
+                invoice["line_items"] = []
+                invoice["payments"] = []
+        return header_data

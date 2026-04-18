@@ -1,13 +1,16 @@
-name: 'restaurant_analytics'
+# dbt_project.yml
+name: 'restaurant_project'
 version: '1.0.0'
-profile: 'restaurant_athena' # Tên profile trong profiles.yml
-model-paths: ["models"]
+config-version: 2
+profile: 'restaurant_analytics'
 
 models:
-  restaurant_analytics:
+  restaurant_project:
     staging:
       +materialized: view
     marts:
       +materialized: table
-      +table_type: iceberg
-      +format: parquet
+      +engine: 'ReplacingMergeTree()' 
+      +order_by: ['report_date', 'order_id']
+      +settings:
+        allow_nullable_key: 1

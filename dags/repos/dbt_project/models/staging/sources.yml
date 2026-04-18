@@ -2,7 +2,6 @@ version: 2
 
 sources:
   - name: cukcuk
-    database: AwsDataCatalog  # Tên database trong Athena/Glue
     schema: restaurant_db
     tables:
       - name: invoice_header

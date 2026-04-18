@@ -1,0 +1,90 @@
+version: 2
+
+exposures:
+
+  # ── Daily Operations Dashboard ──────────────────────────────────────────────
+  - name: daily_operations_dashboard
+    type: dashboard
+    maturity: high
+    url: http://localhost:3000/d/restaurant-daily
+    description: >
+      Real-time operations dashboard refreshed every 10 minutes.
+      Displays revenue, order count, AOV, and delivery breakdown
+      per branch for the current day and trailing 7 days.
+
+    depends_on:
+      - ref('master_sales_analytics')
+      - ref('revenue_daily')
+
+    owner:
+      name: Data Team
+      email: data@restaurant.com
+
+    tags:
+      - operations
+      - real_time
+
+  # ── Revenue Reconciliation Report ───────────────────────────────────────────
+  - name: revenue_reconciliation_report
+    type: analysis
+    maturity: high
+    description: >
+      Weekly finance reconciliation comparing mart revenue vs Silver source
+      of truth. Used by finance team to sign off on weekly P&L.
+      Runs every Sunday as part of the weekly backfill DAG.
+
+    depends_on:
+      - ref('master_sales_analytics')
+      - ref('revenue_daily')
+      - source('cukcuk', 'invoice_header')
+      - source('cukcuk', 'invoice_detail')
+
+    owner:
+      name: Finance Team
+      email: finance@restaurant.com
+
+    tags:
+      - finance
+      - reconciliation
+
+  # ── Branch Performance API ───────────────────────────────────────────────────
+  - name: branch_performance_api
+    type: application
+    maturity: medium
+    description: >
+      Internal REST API serving branch managers with their own branch
+      revenue, top-selling items, and hourly breakdown.
+      Reads from Gold layer via ClickHouse HTTP interface.
+      Per-branch data isolation enforced at API layer (JWT seller_id claim).
+
+    depends_on:
+      - ref('master_sales_analytics')
+
+    owner:
+      name: Backend Team
+      email: backend@restaurant.com
+
+    tags:
+      - api
+      - multi_tenant
+
+  # ── Customer Retention Analysis ──────────────────────────────────────────────
+  - name: customer_retention_analysis
+    type: analysis
+    maturity: low
+    description: >
+      Planned cohort analysis for customer return rate within 30/60/90 days.
+      Will be powered by customer_retention mart model (currently in development).
+      Requires PII-safe customer identifiers from stg_customer.
+
+    depends_on:
+      - ref('stg_customer')
+      - source('cukcuk', 'invoice_header')
+
+    owner:
+      name: Marketing Team
+      email: marketing@restaurant.com
+
+    tags:
+      - marketing
+      - planned
