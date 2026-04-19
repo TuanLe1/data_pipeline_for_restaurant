@@ -109,6 +109,8 @@ services:
     volumes:
       - ./ch_data:/var/lib/clickhouse/
       - ./ch_logs:/var/log/clickhouse-server/
+      # THÊM: mount storage policy config
+      - ./configs/storage_policy.xml:/etc/clickhouse-server/config.d/storage_policy.xml
     environment:
       CLICKHOUSE_USER: admin
       CLICKHOUSE_PASSWORD: password
@@ -175,21 +177,23 @@ services:
         condition: service_healthy
     entrypoint: |
       /bin/sh -c "
-      echo '⏳ Đợi MinIO server (minio-lab) sẵn sàng...'
-      
-      # Thử kết nối và liệt kê bucket cho đến khi thành công
-      # (mc alias set không kiểm tra kết nối ngay, nên ta bồi thêm lệnh 'ls')
-      until /usr/bin/mc alias set myminio http://minio-lab:9000 admin password && /usr/bin/mc ls myminio > /dev/null 2>&1; do
-        echo '...MinIO chưa tỉnh hoặc chưa nhận kết nối, đợi 2s...'
+      echo '⏳ Waiting for MinIO...'
+      until /usr/bin/mc alias set myminio http://minio-lab:9000 admin password && \
+            /usr/bin/mc ls myminio > /dev/null 2>&1; do
+        echo '...retrying in 2s...'
         sleep 2
       done
-
+ 
       set -e
-      echo '🚀 Bắt đầu cấu hình...'
+      echo '🚀 Configuring MinIO buckets...'
+ 
+      # Main data lake bucket
       /usr/bin/mc mb --ignore-existing myminio/restaurant-datalake
       /usr/bin/mc anonymous set download myminio/restaurant-datalake
-      
-      echo '✅ Cấu hình MinIO THỰC SỰ hoàn tất!'
+ 
+      # THÊM: Cold storage bucket cho ClickHouse TTL tiered storage
+      /usr/bin/mc mb --ignore-existing myminio/restaurant-datalake/clickhouse-cold
+      echo '✅ MinIO configured — restaurant-datalake + clickhouse-cold ready!'
       "
   redis-queue:
     image: redis:alpine

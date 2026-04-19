@@ -1,0 +1,37 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <minio_cold>
+                <type>s3</type>
+                <endpoint>http://minio-lab:9000/restaurant-datalake/clickhouse-cold/</endpoint>
+                <access_key_id>admin</access_key_id>
+                <secret_access_key>password</secret_access_key>
+                <region>us-east-1</region>
+                <use_environment_credentials>false</use_environment_credentials>
+                <max_single_part_upload_size>67108864</max_single_part_upload_size>
+                <min_bytes_for_seek>65536</min_bytes_for_seek>
+                <metadata_path>/var/lib/clickhouse/disks/minio_cold/</metadata_path>
+            </minio_cold>
+        </disks>
+
+        <policies>
+            <!--
+                Volume named "default" is required so that ALTER TABLE
+                MODIFY SETTING storage_policy = 'hot_to_cold' works.
+                ClickHouse enforces that the new policy contains all
+                volumes of the old policy (which has a volume named "default").
+            -->
+            <hot_to_cold>
+                <volumes>
+                    <default>
+                        <disk>default</disk>
+                    </default>
+                    <cold>
+                        <disk>minio_cold</disk>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </hot_to_cold>
+        </policies>
+    </storage_configuration>
+</clickhouse>

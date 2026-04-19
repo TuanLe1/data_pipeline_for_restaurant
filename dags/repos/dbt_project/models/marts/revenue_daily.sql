@@ -1,8 +1,14 @@
-{{ config(
-    materialized='table',
-    engine='MergeTree()',
-    order_by=['report_date', 'branch_name']
-) }}
+{{
+    config(
+        materialized='table',
+        engine='MergeTree()',
+        order_by=['report_date', 'branch_name'],
+        post_hook=[
+            "ALTER TABLE {{ this }} MODIFY SETTING storage_policy = 'hot_to_cold'",
+            "ALTER TABLE {{ this }} MODIFY TTL assumeNotNull(report_date) + INTERVAL 30 DAY TO DISK 'minio_cold'"
+        ]
+    )
+}}
 
 WITH raw_data AS (
     -- Đọc từ bảng staging đã được trỏ đúng source

@@ -38,6 +38,7 @@ This project builds a **near real-time analytics pipeline** for a Japanese resta
 
 - Validate a Modern Data Stack architecture locally before cloud deployment
 - Understand how each pipeline component behaves under realistic data volumes
+- Explore ClickHouse engine choices (`ReplacingMergeTree`, `SummingMergeTree`, tiered storage TTL) under real workloads
 - Build a foundation that can scale from 8 → 100+ branches
 
 ---
@@ -48,8 +49,9 @@ This project builds a **near real-time analytics pipeline** for a Japanese resta
 ┌─────────────────────────────────────────────────────────────────┐
 │                        EXTRACTION LAYER                         │
 │                                                                 │
-│  CukCuk API ──► ECS Worker (Producer) ──► Rate Limiter         │
-│  (POS System)    (Async Python)            (Redis)              │
+│  CukCuk API ──► Producer Worker (Async Python)                  │
+│  (POS System)    asyncio.gather — all 8 branches in parallel    │
+│                  Rate Limiter: asyncio.Semaphore(5)             │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ JSONL files per branch
                            ▼
@@ -57,16 +59,16 @@ This project builds a **near real-time analytics pipeline** for a Japanese resta
 │                     LANDING ZONE  (Bronze)                      │
 │                                                                 │
 │         MinIO / S3  ── raw/orders/  ── raw/invoices/           │
-│         S3 Event Notification → Redis Queue                     │
+│         S3 path pushed → Redis Queue (lpush)                    │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ S3 file path message
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      INGESTION LAYER                            │
 │                                                                 │
-│  Redis Queue ──► ECS Consumer ──► ClickHouse INSERT            │
-│  (SQS equiv.)    (Long-poll)       Silver Layer                 │
-│                   Retry → DLQ on 3rd failure                   │
+│  Redis Queue ──► Consumer Worker ──► ClickHouse INSERT          │
+│  (SQS equiv.)    brpop long-poll     Silver Layer               │
+│                  Retry up to 3x → Dead Letter Queue on failure  │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ triggered after queue drains to 0
                            ▼
@@ -83,6 +85,7 @@ This project builds a **near real-time analytics pipeline** for a Japanese resta
 │                      SERVING LAYER                              │
 │                                                                 │
 │   ClickHouse Gold Layer ──► Dashboard / BI Tool                │
+│   Hot data: local NVMe  ──► Cold data: MinIO (TTL 30 days)     │
 └─────────────────────────────────────────────────────────────────┘
 
   Airflow (Orchestrator): Daily master data sync + weekly self-healing backfill
@@ -96,25 +99,26 @@ This project builds a **near real-time analytics pipeline** for a Japanese resta
 
 ```
 Producer Worker
-  for each of 8 branches:
-    1. Get watermark: MAX(order_date) WHERE branch_id = ?
+  Parallel fetch — all 8 branches via asyncio.gather():
+    1. Get per-branch watermark: MAX(order_date / ref_date) WHERE branch_id = ?
     2. Call CukCuk API with LastSyncDate = watermark
-    3. Upload JSONL → MinIO  (raw/orders/{branch_id}_{uuid}.jsonl)
-    4. Push S3 path → Redis Queue
+    3. Upload JSONL → MinIO (raw/orders/{ts}_{branch_prefix}_{uuid}.jsonl)
+    4. Push S3 path → Redis Queue (separate push per table)
 
 Consumer Worker (always running)
   while True:
     1. brpop from Redis Queue
-    2. Download file from MinIO
-    3. Map columns per config schema
-    4. INSERT → ClickHouse Silver  (ReplacingMergeTree)
-    5. On failure: retry up to 3x → Dead Letter Queue
+    2. Download file from MinIO via HTTP
+    3. Map & type-cast columns per config schema (flexible_get, case-insensitive)
+    4. INSERT → ClickHouse Silver (ReplacingMergeTree)
+    5. On failure: retry up to 3x → Dead Letter Queue (failed_ingestion_queue)
 
 Producer (after all branches complete)
-  1. Wait for Redis queue depth = 0
-  2. Trigger: dbt run --select master_sales_analytics revenue_daily
-  3. dbt test  (data quality gate)
-  4. Sleep 10 minutes → repeat
+  1. Poll Redis queue depth every 5s
+  2. When depth = 0 (or 2-min timeout): trigger dbt
+  3. dbt run --select master_sales_analytics revenue_daily
+  4. dbt test  (data quality gate)
+  5. Sleep 10 minutes → repeat
 ```
 
 ### 2. Daily Batch — 1 AM every day
@@ -122,28 +126,31 @@ Producer (after all branches complete)
 ```
 Airflow DAG: restaurant_elt_pipeline
   Task 1: master_extract_to_s3
-          Full snapshot of Product + Customer data → MinIO
+          Full snapshot of Product + Customer → MinIO (RAM → S3, no disk write)
   Task 2: master_load_to_clickhouse
           MinIO → ClickHouse (ReplacingMergeTree dedup)
   Task 3: dbt_transform_and_test
           dbt run + dbt test
+          (target_date param: defaults to {{ ds }}, overridable via UI)
 ```
 
 ### 3. Weekly Self-Healing Backfill — 3 AM every Sunday
 
 ```
 Airflow DAG: maintenance_weekly_backfill
-  Loop over last 7 days:
+  Loop over last 7 days (lookback_days param, default 7):
     run_etl.py --phase trans --step extract --date {date}
-    → re-fetches orders + invoices per branch for that date
+    → re-fetches orders + invoices for ALL 8 branches for that date
+    → each branch pushed as separate S3 key (branch_id prefix prevents collision)
   dbt run → rebuild mart with any backfilled data
+  dbt test → verify no regression
 ```
 
 ### Late-Arriving Data Strategy
 
 | Layer | Mechanism |
 |-------|-----------|
-| Bronze | Per-branch watermark → only fetch deltas |
+| Bronze | Per-branch watermark → only fetch deltas per branch |
 | Silver | `ReplacingMergeTree` deduplicates on insert |
 | Gold | Incremental lookback 2 days catches late records |
 | Weekly | Full re-fetch of last 7 days catches anything missed |
@@ -171,29 +178,30 @@ Airflow DAG: maintenance_weekly_backfill
 ```
 data_pipeline_for_restaurant/
 ├── configs/
-│   └── config.json                  # Schema, column mapping, credentials
+│   ├── config.json                  # Schema, column mapping, credentials
+│   └── storage_policy.xml           # ClickHouse hot/cold tiered storage config
 │
 ├── dags/
-│   ├── restaurant_etl_dag.py        # Daily production DAG
-│   ├── weekly_backfill.py           # Self-healing DAG
+│   ├── restaurant_etl_dag.py        # Daily production DAG (parameterized date)
+│   ├── weekly_backfill.py           # Self-healing DAG (lookback_days param)
 │   ├── dbt_admin_deploy.py          # Manual dbt deploy DAG
 │   │
 │   └── repos/
 │       ├── scripts/
-│       │   ├── producer_worker.py   # Fetch API → MinIO → Redis
-│       │   ├── consumer_worker.py   # Redis → ClickHouse ingestion
+│       │   ├── producer_worker.py   # Async fetch → MinIO → Redis (parallel branches)
+│       │   ├── consumer_worker.py   # Redis → ClickHouse (retry + DLQ)
 │       │   ├── run_etl.py           # CLI entry point for backfill
-│       │   └── init_db.py           # DB + table initialization
+│       │   └── init_db.py           # DB + table init (Silver + Gold with TTL)
 │       │
 │       ├── src/
 │       │   ├── extractors/cukcuk/
-│       │   │   ├── extractor.py     # Async API client, pagination, retry
+│       │   │   ├── extractor.py     # Async API client, pagination, semaphore, retry
 │       │   │   └── auth.py          # HMAC-SHA256 signature auth
 │       │   ├── transformers/
-│       │   │   └── generic_transformer.py   # Schema mapping, type casting
+│       │   │   └── generic_transformer.py   # Schema mapping, type casting, VN timezone
 │       │   ├── loaders/
-│       │   │   ├── clickhouse_loader.py
-│       │   │   └── s3_loader.py
+│       │   │   ├── clickhouse_loader.py     # Insert + schema alignment
+│       │   │   └── s3_loader.py             # RAM → S3 (no disk write)
 │       │   ├── pipelines/
 │       │   │   └── cukcuk_pipeline.py       # Orchestrates extract + load
 │       │   └── utils/
@@ -203,10 +211,11 @@ data_pipeline_for_restaurant/
 │       └── dbt_project/
 │           ├── models/
 │           │   ├── staging/                 # Silver layer (views)
-│           │   └── marts/                   # Gold layer (incremental tables)
+│           │   └── marts/                   # Gold layer (incremental + TTL tables)
 │           ├── tests/                       # Custom data quality tests
-│           └── macros/
-│               └── hash_pii.sql             # MD5 PII anonymization
+│           ├── macros/
+│           │   └── hash_pii.sql             # MD5 PII anonymization
+│           └── exposures.yml                # Downstream dashboard + API lineage
 │
 ├── Dockerfile                       # Airflow image
 ├── Dockerfile_worker                # Producer / Consumer image
@@ -257,11 +266,11 @@ Startup order (managed by `depends_on` health checks):
 1. `postgres` — Airflow metadata DB
 2. `minio` — Object storage
 3. `minio-init` — Creates `restaurant-datalake` bucket
-4. `clickhouse` — Analytics DB
-5. `db-init` — Creates raw tables + first dbt run
+4. `clickhouse` — Analytics DB (mounts `storage_policy.xml` for tiered storage)
+5. `db-init` — Creates Silver tables + Gold mart tables with TTL + first dbt run
 6. `redis-queue` — Message broker
-7. `ingestion-producer` — Starts fetching data every 10 min
-8. `ingestion-consumer` — Starts ingesting from queue
+7. `ingestion-producer` — Starts fetching all 8 branches in parallel every 10 min
+8. `ingestion-consumer` — Long-polls Redis, inserts to ClickHouse
 9. `airflow-webserver` + `airflow-scheduler`
 
 ### 4. Verify the pipeline
@@ -270,8 +279,8 @@ Startup order (managed by `depends_on` health checks):
 # Check all containers are healthy
 docker compose ps
 
-# Watch producer fetch + dbt trigger
-docker compose logs -f ingestion-producer | grep -E "✅|❌|dbt|Sleeping"
+# Watch producer parallel fetch + dbt trigger
+docker compose logs -f ingestion-producer | grep -E "✅|❌|dbt|Sleeping|parallel"
 
 # Watch consumer ingest
 docker compose logs -f ingestion-consumer | grep -E "SUCCESS|FAIL|DLQ"
@@ -316,7 +325,9 @@ docker compose exec ingestion-consumer \
 
 ## Data Model
 
-### Bronze Layer — Raw ClickHouse tables
+### Bronze Layer — Raw ClickHouse tables (Silver in code)
+
+All Silver tables use `ReplacingMergeTree` — ClickHouse deduplicates on background merge using the primary key. Queries use `argMax(col, updated_at)` pattern instead of `SELECT FINAL` for read performance.
 
 | Table | Engine | Order By | Description |
 |-------|--------|----------|-------------|
@@ -334,12 +345,15 @@ docker compose exec ingestion-consumer \
 |-------|-------------|
 | `stg_invoice_header` | Filters nulls/invalid records, adds `report_date`, `year`, `month` |
 | `stg_invoice_detail` | Pass-through from Bronze |
-| `stg_order_header` | Pass-through from Bronze |
+| `stg_order_header` | Pass-through from Bronze (ReplacingMergeTree handles dedup) |
 | `stg_order_detail` | Dedup by `order_detail_id` using `ROW_NUMBER()` |
 | `stg_customer` | Hashes PII: `customer_name`, `customer_tel` → MD5 |
-| `stg_product` | Selects relevant columns only |
+| `stg_product` | Selects relevant columns, renames `inactive` → `is_active` |
+| `stg_invoice_payment` | Pass-through from Bronze |
 
 ### Gold Layer — dbt incremental tables
+
+Both Gold tables have **TTL-based tiered storage**: data stays on local NVMe for 30 days, then moves automatically to MinIO cold disk. Data remains queryable from cold storage at the cost of network I/O.
 
 #### `master_sales_analytics`
 Granular revenue analytics at the invoice line item level.
@@ -357,6 +371,7 @@ Key columns:
 Engine:      ReplacingMergeTree(ref_date)
 Order by:    (report_date, order_id, item_id, ref_detail_id)
 Strategy:    Incremental, lookback 2 days
+Storage:     hot_to_cold — NVMe 30 days → MinIO cold
 ```
 
 #### `revenue_daily`
@@ -368,6 +383,10 @@ Key columns:
   total_orders    = COUNT(DISTINCT ref_id)
   total_revenue   = SUM(total_amount)
   aov             = total_revenue / total_orders
+
+Engine:   MergeTree()
+Order by: (report_date, branch_name)
+Storage:  hot_to_cold — NVMe 30 days → MinIO cold
 ```
 
 ---
@@ -387,7 +406,11 @@ WHERE toDate(ref_date) >= toDate(now()) - 2
 ```
 
 **Why a 2-day lookback?**
-The CukCuk API can return records late due to server-side delays. A 2-day window catches the vast majority of late arrivals. Combined with `ReplacingMergeTree` and `unique_key`, runs are fully idempotent.
+The CukCuk API can return records late due to server-side delays. A 2-day window catches the vast majority of late arrivals. Combined with `ReplacingMergeTree` and `unique_key`, runs are fully idempotent — backfills can be re-run multiple times with consistent results.
+
+**Why `incremental` instead of `materialized_view`?**
+
+The original design used a Materialized View with INNER JOIN. This created a race condition: if `invoice_header` and `invoice_detail` arrived in different INSERT batches, the JOIN would miss and those orders would be silently dropped from the mart. The `incremental` approach lets dbt JOIN after both sides are already in Silver, eliminating the race entirely.
 
 **Why `argMax` instead of `SELECT FINAL`?**
 
@@ -399,6 +422,17 @@ SELECT order_id, status FROM silver_orders FINAL
 -- Equivalent correctness at query time, significantly faster
 SELECT order_id, argMax(status, updated_at) FROM silver_orders GROUP BY order_id
 ```
+
+### Tiered Storage (TTL)
+
+Gold mart tables are created with a `hot_to_cold` storage policy defined in `configs/storage_policy.xml`. Parts older than 30 days are automatically moved to MinIO cold disk:
+
+```sql
+TTL toDate(ref_date) + INTERVAL 30 DAY TO DISK 'minio_cold'
+SETTINGS storage_policy = 'hot_to_cold'
+```
+
+`init_db.py` detects whether the storage policy is available at startup. If not (e.g. `storage_policy.xml` not mounted), it falls back to creating tables without TTL and logs a warning.
 
 ### PII Anonymization
 
@@ -421,7 +455,7 @@ SELECT order_id, argMax(status, updated_at) FROM silver_orders GROUP BY order_id
 
 | Test | File | Failure condition |
 |------|------|-------------------|
-| Revenue reconciliation | `assert_no_revenue_discrepancy.sql` | Mart vs Silver diff > 1% |
+| Revenue reconciliation | `assert_no_revenue_discrepancy.sql` | Mart vs Silver diff > 1% on any day in last 7 days |
 | Duplicate line items | `assert_no_duplicate_line_items.sql` | `mart_rows != unique_keys` |
 | Negative revenue | `assert_revenue_positive.sql` | `net_revenue_inclusive < 0` |
 | Future-dated orders | `assert_order_date_not_in_future.sql` | `order_date > today()` |
@@ -460,6 +494,12 @@ FROM restaurant_db.order_header
 UNION ALL
 SELECT 'invoice_header', max(ref_date)
 FROM restaurant_db.invoice_header;
+
+-- 4. Verify tiered storage TTL is active
+SELECT name, storage_policy
+FROM system.tables
+WHERE database = 'restaurant_db'
+  AND storage_policy != '';
 ```
 
 ### Alerting
@@ -483,6 +523,7 @@ Docker container (Producer)     →  ECS Fargate Task (auto-scaling)
 Docker container (Consumer)     →  ECS Fargate Task (auto-scaling)
 Redis alpine                    →  AWS SQS + Dead Letter Queue
 MinIO                           →  AWS S3 + S3 Event Notifications
+MinIO cold disk (TTL target)    →  AWS S3 Intelligent-Tiering / Glacier
 ClickHouse single node          →  ClickHouse Cloud / Cluster
 Airflow LocalExecutor           →  Amazon MWAA / ECS Airflow
 config.json                     →  AWS SSM Parameter Store
@@ -491,10 +532,10 @@ Slack Webhook                   →  PagerDuty + Slack
 
 ### Scaling Path
 
-| Phase | Sellers | Changes needed |
+| Phase | Branches | Changes needed |
 |-------|---------|----------------|
-| Phase 1 | 1,000 | Current architecture, increase ECS task count |
-| Phase 2 | 10,000 | ClickHouse cluster sharded by `seller_id`, Redis → SQS, distributed job scheduler (DynamoDB lock) |
+| Phase 1 | ~1,000 | Current architecture, increase ECS task count |
+| Phase 2 | ~10,000 | ClickHouse cluster sharded by `seller_id`, Redis → SQS, distributed job scheduler (DynamoDB lock) |
 
 ---
 
@@ -502,52 +543,38 @@ Slack Webhook                   →  PagerDuty + Slack
 
 ### High Priority — required before true production
 
-**1. Parallel branch fetching**
-Currently 8 branches are fetched sequentially, taking 4–8 minutes total.
-Switching to `asyncio.gather` would reduce this to ~1–2 minutes:
-```python
-await asyncio.gather(*[fetch_branch(b_id) for b_id in branch_ids])
-```
+**1. `Decimal(12,4)` for monetary columns**
+`amount`, `tax_amount`, and `total_amount` use `Float32`, causing small rounding errors (~$5 on $42k). Changing to `Decimal(12,4)` in `Target-Schema` and recreating tables eliminates floating-point accumulation. This is the highest-risk silent bug before production.
 
 **2. Authenticated MinIO downloads in Consumer**
-`consumer_worker.py` downloads files via anonymous HTTP.
-Should use `boto3` with credentials for security and reliability.
+`consumer_worker.py` downloads files via anonymous HTTP. Should use `boto3` with credentials for security and reliability.
 
 **3. Slack alerts on dbt test failure**
-Currently dbt test failures only appear in container logs.
-The producer should call the Slack webhook when `result.returncode != 0`.
+Currently dbt test failures only appear in container logs. The producer should call the Slack webhook when `result.returncode != 0`.
 
-**4. Float32 → Decimal(10,4) for monetary columns**
-`amount` and `tax_amount` use `Float32`, causing small rounding errors (~$5 on $42k).
-Changing to `Decimal(10,4)` in `Target-Schema` and recreating tables eliminates this.
+**4. DLQ monitoring**
+When `failed_ingestion_queue` has messages, there is no automatic alert. A periodic Redis check or CloudWatch alarm equivalent is needed to prevent silent data loss.
 
 ### Medium Priority — reliability improvements
 
-**5. MV Reconciliation Job**
-An hourly ECS task that compares Gold vs Silver row counts per `(seller_id, time_window)`.
-Auto-heals windows older than 1 hour where diffs exceed 0.1%.
-Prevents silent data loss from ClickHouse Materialized View failures.
+**5. `SummingMergeTree` for `revenue_daily`**
+`revenue_daily` currently uses `MergeTree()` and is rebuilt in full (`materialized='table'`) every 10 minutes. Switching to `SummingMergeTree((total_orders, total_revenue))` and `incremental` materialization would let ClickHouse accumulate deltas on background merge instead of recomputing from scratch each cycle. This is a meaningful engine optimization to validate at this scale before applying to larger deployments.
 
-**6. Spot Instance checkpoint**
-When running on Spot/Preemptible instances, workers need to checkpoint
-every 500 records to S3. On restart, resume from the checkpoint
-instead of re-fetching the entire batch.
+**6. MV Reconciliation Job**
+An hourly task that compares Gold vs Silver row counts per `(branch_id, time_window)`. Auto-heals windows older than 1 hour where diffs exceed 0.1%. Prevents silent data loss from ClickHouse background merge failures.
 
-**7. End-to-end `ingestion_run_id` tracing**
-Attach a UUID to S3 metadata, Redis message attributes, and a
-`_ingestion_run_id` column in every ClickHouse table.
-Allows tracing any record from API response all the way to the dashboard
-during incident investigation.
+**7. Spot Instance checkpoint**
+When running on Spot/Preemptible instances, workers need to checkpoint every 500 records to S3. On restart, resume from the checkpoint instead of re-fetching the entire batch.
 
-**8. Adaptive Freshness Gap alerting**
-Two-threshold alerting for data staleness:
-- Peak hours (8 AM–10 PM): alert if gap > 15 minutes
-- Off-peak (10 PM–8 AM): alert if gap > 45 minutes
-Prevents alert fatigue from natural traffic drops overnight.
+**8. End-to-end `ingestion_run_id` tracing**
+Attach a UUID to S3 metadata, Redis message attributes, and a `_ingestion_run_id` column in every ClickHouse table. Allows tracing any record from API response all the way to the dashboard during incident investigation.
+
+**9. Adaptive Freshness Gap alerting**
+Two-threshold alerting for data staleness: peak hours (8 AM–10 PM) alert if gap > 15 minutes, off-peak (10 PM–8 AM) alert if gap > 45 minutes. Prevents alert fatigue from natural traffic drops overnight.
 
 ### Low Priority — nice to have
 
-**9. ClickHouse Row-Level Security**
+**10. ClickHouse Row-Level Security**
 Add a fourth isolation layer at the DB level:
 ```sql
 CREATE ROW POLICY branch_isolation ON invoice_header
@@ -555,24 +582,14 @@ USING branch_id = currentUser();
 ```
 Defense-in-depth for multi-tenant deployments.
 
-**10. Customer retention model**
-`customer_retention.sql` is currently empty.
-Opportunity to build cohort analysis: customers returning within 30/60/90 days,
-CLV by branch, repeat visit rate by day-of-week.
-
-**11. dbt Exposures**
-Declare downstream dashboards in dbt `exposures` to track full lineage
-from raw API data to BI tool, enabling impact analysis when upstream schemas change.
+**11. Projection for `branch_name` queries**
+Current `ORDER BY (report_date, order_id, item_id, ref_detail_id)` requires full scan when filtering by branch. Adding a Projection pre-sorted by `(branch_name, report_date)` would make branch-level dashboard queries significantly faster at scale.
 
 **12. Schema evolution handling**
-When CukCuk adds new fields to the API response, the pipeline should
-detect and log them to a `schema_changes` table rather than silently dropping them.
-Alert when a previously unseen field appears.
+When CukCuk adds new fields to the API response, the pipeline silently drops them. A `schema_changes` log table and alert when a previously unseen field appears would make schema drift visible before it becomes a data loss event.
 
 **13. Redis → SQS migration guide**
-A step-by-step guide to migrate from Redis Queue to AWS SQS when scaling.
-The code change is minimal — replace `r.lpush` / `r.brpop`
-with SQS `send_message` / `receive_message`. The architecture remains identical.
+The code change is minimal — replace `r.lpush` / `r.brpop` with SQS `send_message` / `receive_message`. The architecture remains identical. A step-by-step migration guide reduces risk when scaling to Phase 2.
 
 ---
 
@@ -583,6 +600,7 @@ The following was verified end-to-end on 2026-04-18 after full pipeline build an
 | Check | Result |
 |-------|--------|
 | Data freshness | ~10–12 min end-to-end (API → Gold layer) |
+| Parallel branch fetch | All 8 branches fetched concurrently via `asyncio.gather` |
 | Revenue accuracy | `diff = 0.00` between Mart and Silver |
 | Order count accuracy | 100% match across all layers |
 | Duplicate-free | `mart_rows = mart_unique_keys` confirmed |
@@ -591,6 +609,8 @@ The following was verified end-to-end on 2026-04-18 after full pipeline build an
 | Idempotency | Backfill can be re-run multiple times with consistent results |
 | Data quality gates | 4 automated dbt tests pass after every cycle |
 | PII protection | `customer_name` and `customer_tel` hashed with MD5 |
+| Tiered storage | Gold tables TTL active — parts > 30 days migrate to MinIO cold |
+| Storage policy fallback | `init_db.py` gracefully creates tables without TTL if policy missing |
 
 **Revenue reconciliation — confirmed zero diff:**
 
@@ -610,5 +630,6 @@ MIT — free to use for personal and commercial projects.
 ---
 
 *Built to validate Modern Data Stack patterns before deploying to production cloud infrastructure.
-Every architectural decision — Claim Check pattern, per-branch watermarks, incremental dbt with lookback,
-`argMax` over `FINAL`, `ReplacingMergeTree` dedup — directly maps to how the same problems are solved at scale on AWS.*
+Every architectural decision — Claim Check pattern, per-branch watermarks, parallel async fetch,
+incremental dbt with 2-day lookback, `argMax` over `FINAL`, `ReplacingMergeTree` dedup,
+TTL tiered storage to cold MinIO — directly maps to how the same problems are solved at scale on AWS.*

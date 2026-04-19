@@ -1,9 +1,15 @@
-{{ config(
-    materialized='incremental',
-    engine='ReplacingMergeTree(ref_date)',
-    order_by=['report_date', 'order_id', 'item_id', 'ref_detail_id'],
-    unique_key=['report_date', 'order_id', 'item_id', 'ref_detail_id']
-) }}
+{{
+    config(
+        materialized='incremental',
+        engine='ReplacingMergeTree(ref_date)',
+        order_by=['report_date', 'order_id', 'item_id', 'ref_detail_id'],
+        unique_key=['report_date', 'order_id', 'item_id', 'ref_detail_id'],
+        post_hook=[
+            "ALTER TABLE {{ this }} MODIFY SETTING storage_policy = 'hot_to_cold'",
+            "ALTER TABLE {{ this }} MODIFY TTL toDate(ref_date) + INTERVAL 30 DAY TO DISK 'minio_cold'"
+        ]
+    )
+}}
 
 /*
   THAY ĐỔI so với version cũ:
